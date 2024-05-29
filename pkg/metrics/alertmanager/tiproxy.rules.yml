@@ -1,0 +1,64 @@
+# Copyright 2022 PingCAP, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+groups:
+- name: alert.rules
+  rules:
+  - alert: TiProxyServerIsDown
+    expr: up{job="tiproxy"} == 0
+    for: 1m
+    labels:
+      env: ENV_LABELS_ENV
+      severity: emergency
+      expr: up{job="tiproxy"} == 0
+    annotations:
+      description: 'cluster: ENV_LABELS_ENV, instance: {{ $labels.instance }} is down for 1 minute'
+      value: '{{ $value }}'
+      summary: TiProxy server is down
+
+  - alert: TiProxyDiscoveredTimeJumpBack
+    expr: increase(tiproxy_monitor_time_jump_back_total[10m])  > 0
+    for: 1m
+    labels:
+      env: ENV_LABELS_ENV
+      severity: warning
+      expr: increase(tiproxy_monitor_time_jump_back_total[10m])  > 0
+    annotations:
+      description: 'cluster: ENV_LABELS_ENV, instance: {{ $labels.instance }}, values:{{ $value }}'
+      value: '{{ $value }}'
+      summary: TiProxy monitor found time jump back error
+
+  - alert: TiProxyReportErr
+    expr: increase(tiproxy_server_err[10m]) > 0
+    for: 1m
+    labels:
+      env: ENV_LABELS_ENV
+      severity: major
+      expr: increase(tiproxy_server_err[10m]) > 0
+    annotations:
+      description: 'cluster: ENV_LABELS_ENV, instance: {{ $labels.instance }}, value: {{ $value }}'
+      value: '{{ $value }}'
+      summary: TiProxy reports critical error
+
+  - alert: TiProxyGetBackendFail
+    expr: sum(rate(tiproxy_backend_get_backend{res="fail"}[1m])) by (instance) > 10
+    for: 1m
+    labels:
+      env: ENV_LABELS_ENV
+      severity: major
+      expr: sum(rate(tiproxy_backend_get_backend{res="fail"}[1m])) by (instance) > 10
+    annotations:
+      description: 'cluster: ENV_LABELS_ENV, instance: {{ $labels.instance }}, value: {{ $value }}'
+      value: '{{ $value }}'
+      summary: TiProxy fails to get backends
