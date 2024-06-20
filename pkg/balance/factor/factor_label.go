@@ -6,7 +6,7 @@ package factor
 import "github.com/pingcap/tiproxy/lib/config"
 
 const (
-	// balanceCount4Label indicates how many connections to balance in each round.
+	// balanceCount4Label indicates how many connections to balance per second.
 	balanceCount4Label = 1
 )
 
@@ -54,8 +54,11 @@ func (fl *FactorLabel) BalanceCount(from, to scoredBackend) int {
 }
 
 func (fl *FactorLabel) SetConfig(cfg *config.Config) {
-	fl.labelName = cfg.Balance.Label.LabelName
+	fl.labelName = cfg.Balance.LabelName
 	if len(fl.labelName) > 0 && cfg.Labels != nil {
 		fl.selfLabelVal = cfg.Labels[fl.labelName]
 	}
+}
+
+func (fl *FactorLabel) Close() {
 }

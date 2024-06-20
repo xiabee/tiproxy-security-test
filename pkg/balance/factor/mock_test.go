@@ -24,6 +24,7 @@ type mockBackend struct {
 	connScore int
 	connCount int
 	healthy   bool
+	local     bool
 }
 
 func newMockBackend(healthy bool, connScore int) *mockBackend {
@@ -53,6 +54,10 @@ func (mb *mockBackend) GetBackendInfo() observer.BackendInfo {
 	return mb.BackendInfo
 }
 
+func (mb *mockBackend) Local() bool {
+	return mb.local
+}
+
 var _ Factor = (*mockFactor)(nil)
 
 type mockFactor struct {
@@ -80,6 +85,9 @@ func (mf *mockFactor) BalanceCount(from, to scoredBackend) int {
 
 func (mf *mockFactor) SetConfig(cfg *config.Config) {
 	mf.cfg = cfg
+}
+
+func (mf *mockFactor) Close() {
 }
 
 var _ metricsreader.MetricsReader = (*mockMetricsReader)(nil)
@@ -136,12 +144,12 @@ func createBackend(backendIdx, connCount, connScore int) scoredBackend {
 	}
 }
 
-func createSampleStream(cpus []float64, backendIdx int) *model.SampleStream {
+func createSampleStream(values []float64, backendIdx int, curTime model.Time) *model.SampleStream {
 	host := strconv.Itoa(backendIdx)
 	labelSet := model.Metric{metricsreader.LabelNameInstance: model.LabelValue(host + ":10080")}
-	pairs := make([]model.SamplePair, 0, len(cpus))
-	for i, cpu := range cpus {
-		ts := model.Time(time.Now().UnixMilli() - int64(15000*(len(cpus)-i)))
+	pairs := make([]model.SamplePair, 0, len(values))
+	for i, cpu := range values {
+		ts := curTime.Add(15 * time.Second * time.Duration(i-len(values)))
 		pairs = append(pairs, model.SamplePair{Timestamp: ts, Value: model.SampleValue(cpu)})
 	}
 	return &model.SampleStream{Metric: labelSet, Values: pairs}

@@ -42,6 +42,8 @@ type ScoreBasedRouter struct {
 	observeError error
 	// Only store the version of a random backend, so the client may see a wrong version when backends are upgrading.
 	serverVersion string
+	// To limit the speed of redirection.
+	lastRedirectTime monotime.Time
 }
 
 // NewScoreBasedRouter creates a ScoreBasedRouter.
@@ -166,6 +168,7 @@ func (router *ScoreBasedRouter) RedirectConnections() error {
 			connWrapper := ce.Value
 			if connWrapper.phase != phaseRedirectNotify {
 				connWrapper.phase = phaseRedirectNotify
+				connWrapper.redirectReason = "test"
 				// Ignore the results.
 				_ = connWrapper.Redirect(backend)
 				connWrapper.redirectingBackend = backend
@@ -223,7 +226,7 @@ func (router *ScoreBasedRouter) onRedirectFinished(from, to string, conn Redirec
 		connWrapper.phase = phaseRedirectFail
 	}
 	connWrapper.redirectingBackend = nil
-	addMigrateMetrics(from, to, succeed, connWrapper.lastRedirect)
+	addMigrateMetrics(from, to, connWrapper.redirectReason, succeed, connWrapper.lastRedirect)
 }
 
 // OnConnClosed implements ConnEventReceiver.OnConnClosed interface.
@@ -298,12 +301,15 @@ func (router *ScoreBasedRouter) rebalanceLoop(ctx context.Context) {
 		case cfg := <-router.cfgCh:
 			router.policy.SetConfig(cfg)
 		case <-ticker.C:
-			router.rebalance()
+			router.rebalance(ctx)
 		}
 	}
 }
 
-func (router *ScoreBasedRouter) rebalance() {
+// Rebalance every a short time and migrate only a few connections in each round so that:
+// - The lock is not held too long
+// - The connections are migrated to different backends
+func (router *ScoreBasedRouter) rebalance(ctx context.Context) {
 	router.Lock()
 	defer router.Unlock()
 
@@ -315,15 +321,28 @@ func (router *ScoreBasedRouter) rebalance() {
 		backends = append(backends, backend)
 	}
 
-	busiestBackend, idlestBackend, balanceCount, reason := router.policy.BackendsToBalance(backends)
+	busiestBackend, idlestBackend, balanceCount, reason, logFields := router.policy.BackendsToBalance(backends)
 	if balanceCount == 0 {
 		return
 	}
 	fromBackend, toBackend := busiestBackend.(*backendWrapper), idlestBackend.(*backendWrapper)
 
-	// Migrate connCount connections.
+	// Control the speed of migration.
 	curTime := monotime.Now()
-	for i := 0; i < balanceCount; i++ {
+	if balanceCount*int(rebalanceInterval) >= int(time.Second) {
+		// If we need to migrate multiple connections in each round, calculate the connection count for each round.
+		balanceCount = balanceCount * int(rebalanceInterval) / int(time.Second)
+	} else {
+		// If we need to wait for multiple rounds to migrate a connection, calculate the interval for each connection.
+		intervalPerConn := time.Second / time.Duration(balanceCount)
+		if curTime-router.lastRedirectTime >= monotime.Time(intervalPerConn) {
+			balanceCount = 1
+		} else {
+			return
+		}
+	}
+	// Migrate balanceCount connections.
+	for i := 0; i < balanceCount && ctx.Err() == nil; i++ {
 		var ce *glist.Element[*connWrapper]
 		for ele := fromBackend.connList.Front(); ele != nil; ele = ele.Next() {
 			conn := ele.Value
@@ -343,23 +362,25 @@ func (router *ScoreBasedRouter) rebalance() {
 		if ce == nil {
 			break
 		}
-		router.redirectConn(ce.Value, fromBackend, toBackend, reason, curTime)
+		router.redirectConn(ce.Value, fromBackend, toBackend, reason, logFields, curTime)
+		router.lastRedirectTime = curTime
 	}
 }
 
 func (router *ScoreBasedRouter) redirectConn(conn *connWrapper, fromBackend *backendWrapper, toBackend *backendWrapper,
-	reason []zap.Field, curTime monotime.Time) {
+	reason string, logFields []zap.Field, curTime monotime.Time) {
 	fields := []zap.Field{
 		zap.Uint64("connID", conn.ConnectionID()),
 		zap.String("from", fromBackend.addr),
 		zap.String("to", toBackend.addr),
 	}
-	fields = append(fields, reason...)
+	fields = append(fields, logFields...)
 	router.logger.Debug("begin redirect connection", fields...)
 	fromBackend.connScore--
 	router.removeBackendIfEmpty(fromBackend)
 	toBackend.connScore++
 	conn.phase = phaseRedirectNotify
+	conn.redirectReason = reason
 	conn.lastRedirect = curTime
 	conn.Redirect(toBackend)
 	conn.redirectingBackend = toBackend

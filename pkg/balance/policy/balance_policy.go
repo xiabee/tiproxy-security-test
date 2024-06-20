@@ -12,7 +12,8 @@ import (
 type BalancePolicy interface {
 	Init(cfg *config.Config)
 	BackendToRoute(backends []BackendCtx) BackendCtx
-	BackendsToBalance(backends []BackendCtx) (from, to BackendCtx, balanceCount int, reason []zap.Field)
+	// balanceCount is the count of connections to balance per second.
+	BackendsToBalance(backends []BackendCtx) (from, to BackendCtx, balanceCount int, reason string, logFields []zap.Field)
 	SetConfig(cfg *config.Config)
 }
 
@@ -23,5 +24,6 @@ type BackendCtx interface {
 	// ConnScore = current connections + incoming connections - outgoing connections.
 	ConnScore() int
 	Healthy() bool
+	Local() bool
 	GetBackendInfo() observer.BackendInfo
 }

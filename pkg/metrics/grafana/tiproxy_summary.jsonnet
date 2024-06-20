@@ -199,6 +199,7 @@ local uptimeP = graphPanel.new(
   datasource=myDS,
   legend_rightSide=true,
   format='s',
+  logBase1Y=2,
   description='TiProxy uptime since the last restart.',
 )
 .addTarget(
@@ -214,8 +215,9 @@ local durationP = graphPanel.new(
   title='Duration',
   datasource=myDS,
   legend_rightSide=true,
-  description='TiProxy query durations by histogram buckets with different percents.',
   format='s',
+  logBase1Y=2,
+  description='TiProxy query durations by histogram buckets with different percents.',
 )
 .addTarget(
   prometheus.target(
@@ -242,6 +244,7 @@ local durByInstP = graphPanel.new(
   legend_rightSide=true,
   description='TiProxy P99 query durations by TiProxy instances.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -256,6 +259,7 @@ local durByBackP = graphPanel.new(
   legend_rightSide=true,
   description='TiProxy P99 query durations by backends.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -270,6 +274,7 @@ local cpsByInstP = graphPanel.new(
   legend_rightSide=true,
   description='TiProxy query total statistics including both successful and failed ones.',
   format='short',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -284,6 +289,7 @@ local cpsByBackP = graphPanel.new(
   legend_rightSide=true,
   description='MySQL command statistics by backends.',
   format='short',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -298,6 +304,7 @@ local cpsByCMDP = graphPanel.new(
   legend_rightSide=true,
   description='MySQL command statistics by command type',
   format='short',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -312,6 +319,7 @@ local hsDurP= graphPanel.new(
   legend_rightSide=true,
   description='TiProxy handshake durations by different percents.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -354,6 +362,7 @@ local bMigCounterP = graphPanel.new(
   legend_rightSide=true,
   description='OPM of session migrations on all backends.',
   format='short',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -368,6 +377,7 @@ local bMigDurP = graphPanel.new(
   legend_rightSide=true,
   description='Duration of session migrations.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -388,6 +398,21 @@ local bMigDurP = graphPanel.new(
   )
 );
 
+local bMigReasonP = graphPanel.new(
+  title='Session Migration Reasons',
+  datasource=myDS,
+  legend_rightSide=true,
+  description='Reasons of session migrations per minute.',
+  format='short',
+  logBase1Y=2,
+)
+.addTarget(
+  prometheus.target(
+    'sum(increase(tiproxy_balance_migrate_total{k8s_cluster="$k8s_cluster", tidb_cluster="$tidb_cluster", instance=~"$instance"}[1m])) by (reason)',
+    legendFormat='{{reason}}',
+  )
+);
+
 // Backend Summary
 local backendRow = row.new(collapse=true, title='Backend');
 local bGetDurP = graphPanel.new(
@@ -396,6 +421,7 @@ local bGetDurP = graphPanel.new(
   legend_rightSide=true,
   description='Duration of getting an available backend.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -422,6 +448,7 @@ local bPingBeP = graphPanel.new(
   legend_rightSide=true,
   description='Duration of Pinging backends.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -437,6 +464,7 @@ graphPanel.new(
   legend_rightSide=true,
   description='Duration of each health check cycle.',
   format='s',
+  logBase1Y=2,
 )
 .addTarget(
   prometheus.target(
@@ -503,6 +531,20 @@ local outPacketsP = graphPanel.new(
   )
 );
 
+local crossBytesP = graphPanel.new(
+  title='Cross Location Bytes/Second',
+  datasource=myDS,
+  legend_rightSide=true,
+  description='Bytes per second between TiProxy and cross-location backends.',
+  format='short',
+)
+.addTarget(
+  prometheus.target(
+    'sum(rate(tiproxy_traffic_cross_location_bytes{k8s_cluster="$k8s_cluster", tidb_cluster="$tidb_cluster", instance=~"$instance"}[1m])) by (instance)',
+    legendFormat='{{instance}}',
+  )
+);
+
 // Merge together.
 local panelW = 12;
 local panelH = 6;
@@ -543,6 +585,7 @@ newDash
   .addPanel(bConnP, gridPos=leftPanelPos)
   .addPanel(bMigCounterP, gridPos=rightPanelPos)
   .addPanel(bMigDurP, gridPos=leftPanelPos)
+  .addPanel(bMigReasonP, gridPos=rightPanelPos)
   ,
   gridPos=rowPos
 )
@@ -560,6 +603,7 @@ newDash
   .addPanel(inPacketsP, gridPos=rightPanelPos)
   .addPanel(outBytesP, gridPos=leftPanelPos)
   .addPanel(outPacketsP, gridPos=rightPanelPos)
+  .addPanel(crossBytesP, gridPos=leftPanelPos)
   ,
   gridPos=rowPos
 )

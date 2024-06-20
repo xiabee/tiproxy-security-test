@@ -9,8 +9,8 @@ const (
 	// connBalancedRatio is the threshold of ratio of the most connection count and least count.
 	// If the ratio exceeds the threshold, we migrate connections.
 	connBalancedRatio = 1.2
-	// balanceCount4Conn indicates how many connections to balance in each round.
-	// This is not urgent, so migrate slowly.
+	// balanceCount4Conn indicates how many connections to balance per second.
+	// Migrate slowly because we don't know the CPU usage here and we may migrate too many connections.
 	balanceCount4Conn = 1
 )
 
@@ -48,4 +48,7 @@ func (fcc *FactorConnCount) BalanceCount(from, to scoredBackend) int {
 }
 
 func (fcc *FactorConnCount) SetConfig(cfg *config.Config) {
+}
+
+func (fcc *FactorConnCount) Close() {
 }

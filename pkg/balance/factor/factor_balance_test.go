@@ -136,11 +136,12 @@ func TestBalanceWithOneFactor(t *testing.T) {
 			}
 		}
 		backends := createBackends(len(test.scores))
-		from, to, count, _ := fm.BackendsToBalance(backends)
+		from, to, count, reason, _ := fm.BackendsToBalance(backends)
 		require.Equal(t, test.count, count, "test index %d", tIdx)
 		if test.count > 0 {
 			require.Equal(t, backends[test.fromIdx], from, "test index %d", tIdx)
 			require.Equal(t, backends[test.toIdx], to, "test index %d", tIdx)
+			require.Equal(t, "mock", reason, "test index %d", tIdx)
 		} else {
 			require.Nil(t, from, "test index %d", tIdx)
 			require.Nil(t, to, "test index %d", tIdx)
@@ -215,7 +216,7 @@ func TestBalanceWith2Factors(t *testing.T) {
 			}
 		}
 		backends := createBackends(len(test.scores1))
-		from, to, count, _ := fm.BackendsToBalance(backends)
+		from, to, count, _, _ := fm.BackendsToBalance(backends)
 		require.Equal(t, test.count, count, "test index %d", tIdx)
 		if test.count > 0 {
 			require.Equal(t, backends[test.fromIdx], from, "test index %d", tIdx)
@@ -266,7 +267,7 @@ func TestBalanceWith3Factors(t *testing.T) {
 			}(factorIdx, factor)
 		}
 		backends := createBackends(len(test.scores))
-		from, to, count, _ := fm.BackendsToBalance(backends)
+		from, to, count, _, _ := fm.BackendsToBalance(backends)
 		require.Equal(t, test.count, count, "test index %d", tIdx)
 		if test.count > 0 {
 			require.Equal(t, backends[test.fromIdx], from, "test index %d", tIdx)
@@ -275,20 +276,6 @@ func TestBalanceWith3Factors(t *testing.T) {
 			require.Nil(t, from, "test index %d", tIdx)
 			require.Nil(t, to, "test index %d", tIdx)
 		}
-	}
-}
-
-func TestSetFactorConfig(t *testing.T) {
-	lg, _ := logger.CreateLoggerForTest(t)
-	fm := NewFactorBasedBalance(lg, newMockMetricsReader())
-	factors := []*mockFactor{{bitNum: 1}, {bitNum: 2}, {bitNum: 2}}
-	fm.factors = []Factor{factors[0], factors[1], factors[2]}
-	cfg := &config.Config{
-		Labels: map[string]string{"k1": "v1"},
-	}
-	fm.SetConfig(cfg)
-	for _, factor := range factors {
-		require.Equal(t, "v1", factor.cfg.Labels["k1"])
 	}
 }
 
@@ -316,4 +303,66 @@ func createBackends(num int) []policy.BackendCtx {
 		backends = append(backends, newMockBackend(true, 100))
 	}
 	return backends
+}
+
+func TestSetFactors(t *testing.T) {
+	tests := []struct {
+		setFunc       func(balance *config.Balance)
+		expectedNames []string
+	}{
+		{
+			setFunc:       func(balance *config.Balance) {},
+			expectedNames: []string{"status", "health", "memory", "cpu", "location", "conn"},
+		},
+		{
+			setFunc: func(balance *config.Balance) {
+				balance.Policy = config.BalancePolicyLocation
+			},
+			expectedNames: []string{"status", "location", "health", "memory", "cpu", "conn"},
+		},
+		{
+			setFunc: func(balance *config.Balance) {
+				balance.LabelName = "group"
+			},
+			expectedNames: []string{"status", "label", "health", "memory", "cpu", "location", "conn"},
+		},
+		{
+			setFunc: func(balance *config.Balance) {
+				balance.Policy = config.BalancePolicyLocation
+				balance.LabelName = "group"
+			},
+			expectedNames: []string{"status", "label", "location", "health", "memory", "cpu", "conn"},
+		},
+		{
+			setFunc: func(balance *config.Balance) {
+				balance.Policy = config.BalancePolicyConnection
+			},
+			expectedNames: []string{"status", "conn"},
+		},
+		{
+			setFunc: func(balance *config.Balance) {
+				balance.Policy = config.BalancePolicyConnection
+				balance.LabelName = "group"
+			},
+			expectedNames: []string{"status", "label", "conn"},
+		},
+	}
+
+	lg, _ := logger.CreateLoggerForTest(t)
+	fm := NewFactorBasedBalance(lg, newMockMetricsReader())
+	for i, test := range tests {
+		cfg := &config.Config{
+			Balance: config.Balance{
+				Policy: config.BalancePolicyResource,
+			},
+		}
+		fm.Init(cfg)
+		test.setFunc(&cfg.Balance)
+		fm.SetConfig(cfg)
+		require.Len(t, fm.factors, len(test.expectedNames), "test index %d", i)
+		for j := 0; j < len(fm.factors); j++ {
+			require.Equal(t, test.expectedNames[j], fm.factors[j].Name(), "test index %d", i)
+		}
+	}
+	fm.Close()
 }

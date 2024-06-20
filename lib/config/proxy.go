@@ -116,14 +116,6 @@ type Security struct {
 	RequireBackendTLS bool      `yaml:"require-backend-tls,omitempty" toml:"require-backend-tls,omitempty" json:"require-backend-tls,omitempty"`
 }
 
-type Balance struct {
-	Label LabelBalance `yaml:"label,omitempty" toml:"label,omitempty" json:"label,omitempty"`
-}
-
-type LabelBalance struct {
-	LabelName string `yaml:"label-name,omitempty" toml:"label-name,omitempty" json:"label-name,omitempty"`
-}
-
 func DefaultKeepAlive() (frontend, backendHealthy, backendUnhealthy KeepAlive) {
 	frontend.Enabled = true
 	backendHealthy.Enabled = true
@@ -161,6 +153,8 @@ func NewConfig() *Config {
 	cfg.Security.ServerHTTPTLS.MinTLSVersion = "1.2"
 	cfg.Security.ClusterTLS.MinTLSVersion = "1.2"
 
+	cfg.Balance = DefaultBalance()
+
 	return &cfg
 }
 
@@ -187,6 +181,10 @@ func (cfg *Config) Check() error {
 
 	if cfg.Proxy.ConnBufferSize > 0 && (cfg.Proxy.ConnBufferSize > 16*1024*1024 || cfg.Proxy.ConnBufferSize < 1024) {
 		return errors.Wrapf(ErrInvalidConfigValue, "conn-buffer-size must be between 1K and 16M")
+	}
+
+	if err := cfg.Balance.Check(); err != nil {
+		return err
 	}
 
 	return nil

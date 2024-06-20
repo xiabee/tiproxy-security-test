@@ -22,10 +22,17 @@ var _ policy.BalancePolicy = (*FactorBasedBalance)(nil)
 type FactorBasedBalance struct {
 	factors []Factor
 	// to reduce memory allocation
-	cachedList  []scoredBackend
-	mr          metricsreader.MetricsReader
-	lg          *zap.Logger
-	totalBitNum int
+	cachedList      []scoredBackend
+	mr              metricsreader.MetricsReader
+	lg              *zap.Logger
+	factorStatus    *FactorStatus
+	factorLabel     *FactorLabel
+	factorHealth    *FactorHealth
+	factorMemory    *FactorMemory
+	factorCPU       *FactorCPU
+	factorLocation  *FactorLocation
+	factorConnCount *FactorConnCount
+	totalBitNum     int
 }
 
 func NewFactorBasedBalance(lg *zap.Logger, mr metricsreader.MetricsReader) *FactorBasedBalance {
@@ -39,19 +46,80 @@ func NewFactorBasedBalance(lg *zap.Logger, mr metricsreader.MetricsReader) *Fact
 // Init creates factors at the first time.
 // TODO: create factors according to config and update policy when config changes.
 func (fbb *FactorBasedBalance) Init(cfg *config.Config) {
-	fbb.factors = []Factor{
-		NewFactorHealth(),
-		NewFactorError(fbb.mr),
-		NewFactorMemory(fbb.mr),
-		NewFactorCPU(fbb.mr),
-		NewFactorLabel(),
-		NewFactorConnCount(),
+	fbb.factors = make([]Factor, 0, 7)
+	fbb.setFactors(cfg)
+}
+
+func (fbb *FactorBasedBalance) setFactors(cfg *config.Config) {
+	fbb.factors = fbb.factors[:0]
+
+	if fbb.factorStatus == nil {
+		fbb.factorStatus = NewFactorStatus()
 	}
+	fbb.factors = append(fbb.factors, fbb.factorStatus)
+
+	if cfg.Balance.LabelName != "" {
+		if fbb.factorLabel == nil {
+			fbb.factorLabel = NewFactorLabel()
+		}
+		fbb.factors = append(fbb.factors, fbb.factorLabel)
+	} else if fbb.factorLabel != nil {
+		fbb.factorLabel.Close()
+		fbb.factorLabel = nil
+	}
+
+	switch cfg.Balance.Policy {
+	case config.BalancePolicyResource, config.BalancePolicyLocation:
+		if fbb.factorLocation == nil {
+			fbb.factorLocation = NewFactorLocation()
+		}
+		if fbb.factorHealth == nil {
+			fbb.factorHealth = NewFactorHealth(fbb.mr)
+		}
+		if fbb.factorMemory == nil {
+			fbb.factorMemory = NewFactorMemory(fbb.mr)
+		}
+		if fbb.factorCPU == nil {
+			fbb.factorCPU = NewFactorCPU(fbb.mr)
+		}
+	default:
+		if fbb.factorLocation != nil {
+			fbb.factorLocation.Close()
+			fbb.factorLocation = nil
+		}
+		if fbb.factorHealth != nil {
+			fbb.factorHealth.Close()
+			fbb.factorHealth = nil
+		}
+		if fbb.factorMemory != nil {
+			fbb.factorMemory.Close()
+			fbb.factorMemory = nil
+		}
+		if fbb.factorCPU != nil {
+			fbb.factorCPU.Close()
+			fbb.factorCPU = nil
+		}
+	}
+
+	switch cfg.Balance.Policy {
+	case config.BalancePolicyResource:
+		fbb.factors = append(fbb.factors, fbb.factorHealth, fbb.factorMemory, fbb.factorCPU, fbb.factorLocation)
+	case config.BalancePolicyLocation:
+		fbb.factors = append(fbb.factors, fbb.factorLocation, fbb.factorHealth, fbb.factorMemory, fbb.factorCPU)
+	}
+
+	if fbb.factorConnCount == nil {
+		fbb.factorConnCount = NewFactorConnCount()
+	}
+	fbb.factors = append(fbb.factors, fbb.factorConnCount)
+
 	err := fbb.updateBitNum()
 	if err != nil {
 		panic(err.Error())
 	}
-	fbb.SetConfig(cfg)
+	for _, factor := range fbb.factors {
+		factor.SetConfig(cfg)
+	}
 }
 
 func (fbb *FactorBasedBalance) updateBitNum() error {
@@ -108,7 +176,7 @@ func (fbb *FactorBasedBalance) BackendToRoute(backends []policy.BackendCtx) poli
 // BackendsToBalance returns the busiest/unhealthy backend and the idlest backend.
 // balanceCount: the count of connections to migrate in this round. 0 indicates no need to balance.
 // reason: the debug information to be logged.
-func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (from, to policy.BackendCtx, balanceCount int, reason []zap.Field) {
+func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (from, to policy.BackendCtx, balanceCount int, reason string, logFields []zap.Field) {
 	if len(backends) <= 1 {
 		return
 	}
@@ -158,20 +226,25 @@ func (fbb *FactorBasedBalance) BackendsToBalance(backends []policy.BackendCtx) (
 			// backend1 factor scores: 1, 0, 1
 			// backend2 factor scores: 0, 1, 0
 			// Balancing the third factor may make the second factor unbalanced, although it's in the same order with the first factor.
-			return nil, nil, 0, nil
+			return
 		}
 		leftBitNum -= bitNum
 	}
+	reason = factor.Name()
 	fields := []zap.Field{
-		zap.String("factor", factor.Name()),
+		zap.String("factor", reason),
 		zap.Uint64("from_score", maxScore),
 		zap.Uint64("to_score", minScore),
 	}
-	return busiestBackend.BackendCtx, idlestBackend.BackendCtx, balanceCount, fields
+	return busiestBackend.BackendCtx, idlestBackend.BackendCtx, balanceCount, reason, fields
 }
 
 func (fbb *FactorBasedBalance) SetConfig(cfg *config.Config) {
+	fbb.setFactors(cfg)
+}
+
+func (fbb *FactorBasedBalance) Close() {
 	for _, factor := range fbb.factors {
-		factor.SetConfig(cfg)
+		factor.Close()
 	}
 }
