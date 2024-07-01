@@ -16,7 +16,7 @@ import (
 const (
 	errMetricExpDuration = 1 * time.Minute
 	// balanceSeconds4Health indicates the time (in seconds) to migrate all the connections.
-	balanceSeconds4Health = 10
+	balanceSeconds4Health = 5.0
 )
 
 type valueRange int
@@ -58,15 +58,17 @@ var (
 	errDefinitions = []errDefinition{
 		{
 			// may be caused by disconnection to PD
-			// test with no connection: around 80
-			promQL:           `sum(increase(tidb_tikvclient_backoff_seconds_count{type="pdRPC"}[1m])) by (instance)`,
-			failThreshold:    100,
+			// test with no connection in no network: around 80/m
+			// test with 100 connections in unstable network: [50, 135]/2m
+			promQL:           `sum(increase(tidb_tikvclient_backoff_seconds_count{type="pdRPC"}[2m])) by (instance)`,
+			failThreshold:    50,
 			recoverThreshold: 10,
 		},
 		{
 			// may be caused by disconnection to TiKV
-			// test with no connection: regionMiss is around 1300, tikvRPC is around 40
-			promQL:           `sum(increase(tidb_tikvclient_backoff_seconds_count{type=~"regionMiss|tikvRPC"}[1m])) by (instance)`,
+			// test with no connection in no network: regionMiss is around 1300/m, tikvRPC is around 40/m
+			// test with 100 connections in unstable network: [1000, 3300]/2m
+			promQL:           `sum(increase(tidb_tikvclient_backoff_seconds_count{type=~"regionMiss|tikvRPC"}[2m])) by (instance)`,
 			failThreshold:    1000,
 			recoverThreshold: 100,
 		},
@@ -79,6 +81,8 @@ var _ Factor = (*FactorHealth)(nil)
 type healthBackendSnapshot struct {
 	updatedTime monotime.Time
 	valueRange  valueRange
+	// Record the balance count when the backend becomes unhealthy so that it won't be smaller in the next rounds.
+	balanceCount float64
 }
 
 type errIndicator struct {
@@ -185,9 +189,20 @@ func (fh *FactorHealth) updateSnapshot(backends []scoredBackend) {
 			}
 			continue
 		}
+		// Set balance count if the backend is unhealthy, otherwise reset it to 0.
+		var balanceCount float64
+		if valueRange >= valueRangeAbnormal {
+			if existSnapshot && snapshot.balanceCount > 0.0001 {
+				balanceCount = snapshot.balanceCount
+			} else {
+				balanceCount = float64(backend.ConnScore()) / balanceSeconds4Health
+			}
+		}
+
 		snapshots[addr] = healthBackendSnapshot{
-			updatedTime: updatedTime,
-			valueRange:  valueRange,
+			updatedTime:  updatedTime,
+			valueRange:   valueRange,
+			balanceCount: balanceCount,
 		}
 	}
 	fh.snapshot = snapshots
@@ -221,39 +236,22 @@ func calcValueRange(sample *model.Sample, indicator errIndicator) valueRange {
 }
 
 func (fh *FactorHealth) caclErrScore(addr string) int {
-	snapshot, ok := fh.snapshot[addr]
-	if !ok {
-		return 2
-	}
-	switch snapshot.valueRange {
-	case valueRangeNormal:
-		return 0
-	case valueRangeMid:
-		return 1
-	default:
-		return 2
-	}
+	// If the backend has no metrics (not in snapshot), take it as healthy.
+	return int(fh.snapshot[addr].valueRange)
 }
 
 func (fh *FactorHealth) ScoreBitNum() int {
 	return fh.bitNum
 }
 
-func (fh *FactorHealth) BalanceCount(from, to scoredBackend) int {
+func (fh *FactorHealth) BalanceCount(from, to scoredBackend) float64 {
 	// Only migrate connections when one is valueRangeNormal and the other is valueRangeAbnormal.
 	fromScore := fh.caclErrScore(from.Addr())
 	toScore := fh.caclErrScore(to.Addr())
-	if fromScore-toScore > 1 {
-		// Assuming that the source and target backends have similar connections at first.
-		// We wish the connections to be migrated in 10 seconds but only a few are migrated in each round.
-		// If we use from.ConnScore() / 10, the migration will be slower and slower.
-		conns := (from.ConnScore() + to.ConnScore()) / (balanceSeconds4Health * 2)
-		if conns > 0 {
-			return conns
-		}
-		return 1
+	if fromScore-toScore <= 1 {
+		return 0
 	}
-	return 0
+	return fh.snapshot[from.Addr()].balanceCount
 }
 
 func (fh *FactorHealth) SetConfig(cfg *config.Config) {
