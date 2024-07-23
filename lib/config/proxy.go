@@ -5,12 +5,15 @@ package config
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/lib/util/sys"
 )
 
 var (
@@ -27,6 +30,7 @@ type Config struct {
 	Log      Log               `yaml:"log,omitempty" toml:"log,omitempty" json:"log,omitempty"`
 	Balance  Balance           `yaml:"balance,omitempty" toml:"balance,omitempty" json:"balance,omitempty"`
 	Labels   map[string]string `yaml:"labels,omitempty" toml:"labels,omitempty" json:"labels,omitempty"`
+	HA       HA                `yaml:"ha,omitempty" toml:"ha,omitempty" json:"ha,omitempty"`
 }
 
 type KeepAlive struct {
@@ -116,6 +120,11 @@ type Security struct {
 	RequireBackendTLS bool      `yaml:"require-backend-tls,omitempty" toml:"require-backend-tls,omitempty" json:"require-backend-tls,omitempty"`
 }
 
+type HA struct {
+	VirtualIP string `yaml:"virtual-ip,omitempty" toml:"virtual-ip,omitempty" json:"virtual-ip,omitempty"`
+	Interface string `yaml:"interface,omitempty" toml:"interface,omitempty" json:"interface,omitempty"`
+}
+
 func DefaultKeepAlive() (frontend, backendHealthy, backendUnhealthy KeepAlive) {
 	frontend.Enabled = true
 	backendHealthy.Enabled = true
@@ -194,4 +203,31 @@ func (cfg *Config) ToBytes() ([]byte, error) {
 	b := new(bytes.Buffer)
 	err := toml.NewEncoder(b).Encode(cfg)
 	return b.Bytes(), errors.WithStack(err)
+}
+
+func (cfg *Config) GetIPPort() (ip, port, statusPort string, err error) {
+	addrs := strings.Split(cfg.Proxy.Addr, ",")
+	ip, port, err = net.SplitHostPort(addrs[0])
+	if err != nil {
+		err = errors.WithStack(err)
+		return
+	}
+	_, statusPort, err = net.SplitHostPort(cfg.API.Addr)
+	if err != nil {
+		err = errors.WithStack(err)
+		return
+	}
+	// AdvertiseAddr may be a DNS in k8s and certificate SAN typically contains DNS but not IP.
+	if len(cfg.Proxy.AdvertiseAddr) > 0 {
+		ip = cfg.Proxy.AdvertiseAddr
+	} else {
+		// reporting a non unicast IP makes no sense, try to find one
+		// loopback/linklocal-unicast are not global unicast IP, but are valid local unicast IP
+		if pip := net.ParseIP(ip); ip == "" || pip.Equal(net.IPv4bcast) || pip.IsUnspecified() || pip.IsMulticast() {
+			if v := sys.GetGlobalUnicastIP(); v != "" {
+				ip = v
+			}
+		}
+	}
+	return
 }

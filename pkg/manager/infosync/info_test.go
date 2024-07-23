@@ -17,6 +17,7 @@ import (
 	"github.com/pingcap/tiproxy/lib/util/sys"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
+	"github.com/pingcap/tiproxy/pkg/util/etcd"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
@@ -99,11 +100,11 @@ func TestFetchTiDBTopology(t *testing.T) {
 
 	tests := []struct {
 		update func()
-		check  func(info map[string]*TiDBInfo)
+		check  func(info map[string]*TiDBTopologyInfo)
 	}{
 		{
 			// No backends.
-			check: func(info map[string]*TiDBInfo) {
+			check: func(info map[string]*TiDBTopologyInfo) {
 				require.Empty(t, info)
 			},
 		},
@@ -112,10 +113,8 @@ func TestFetchTiDBTopology(t *testing.T) {
 			update: func() {
 				ts.updateTTL("1.1.1.1:4000", []byte("123456789"))
 			},
-			check: func(info map[string]*TiDBInfo) {
-				require.Len(ts.t, info, 1)
-				require.Equal(ts.t, "123456789", info["1.1.1.1:4000"].TTL)
-				require.Nil(ts.t, info["1.1.1.1:4000"].TiDBTopologyInfo)
+			check: func(info map[string]*TiDBTopologyInfo) {
+				require.Len(ts.t, info, 0)
 			},
 		},
 		{
@@ -126,10 +125,9 @@ func TestFetchTiDBTopology(t *testing.T) {
 					StatusPort: 10080,
 				})
 			},
-			check: func(info map[string]*TiDBInfo) {
+			check: func(info map[string]*TiDBTopologyInfo) {
 				require.Len(ts.t, info, 1)
-				require.Equal(ts.t, "123456789", info["1.1.1.1:4000"].TTL)
-				require.NotNil(ts.t, info["1.1.1.1:4000"].TiDBTopologyInfo)
+				require.NotNil(ts.t, info["1.1.1.1:4000"])
 				require.Equal(ts.t, "1.1.1.1", info["1.1.1.1:4000"].IP)
 				require.Equal(ts.t, uint(10080), info["1.1.1.1:4000"].StatusPort)
 			},
@@ -143,10 +141,9 @@ func TestFetchTiDBTopology(t *testing.T) {
 					StatusPort: 10080,
 				})
 			},
-			check: func(info map[string]*TiDBInfo) {
+			check: func(info map[string]*TiDBTopologyInfo) {
 				require.Len(ts.t, info, 2)
-				require.Equal(ts.t, "123456789", info["2.2.2.2:4000"].TTL)
-				require.NotNil(ts.t, info["2.2.2.2:4000"].TiDBTopologyInfo)
+				require.NotNil(ts.t, info["2.2.2.2:4000"])
 				require.Equal(ts.t, "2.2.2.2", info["2.2.2.2:4000"].IP)
 				require.Equal(ts.t, uint(10080), info["2.2.2.2:4000"].StatusPort)
 			},
@@ -156,10 +153,9 @@ func TestFetchTiDBTopology(t *testing.T) {
 			update: func() {
 				ts.deleteTTL("2.2.2.2:4000")
 			},
-			check: func(info map[string]*TiDBInfo) {
-				require.Len(ts.t, info, 2)
-				require.Empty(ts.t, info["2.2.2.2:4000"].TTL)
-				require.NotNil(ts.t, info["2.2.2.2:4000"].TiDBTopologyInfo)
+			check: func(info map[string]*TiDBTopologyInfo) {
+				require.Len(ts.t, info, 1)
+				require.Contains(ts.t, info, "1.1.1.1:4000")
 			},
 		},
 	}
@@ -276,12 +272,16 @@ func newEtcdTestSuite(t *testing.T) *etcdTestSuite {
 
 	ts.startServer("0.0.0.0:0")
 	endpoint := ts.server.Clients[0].Addr().String()
-	cfg := newConfig(endpoint)
+	cfg := etcd.ConfigForEtcdTest(endpoint)
 
 	certMgr := cert.NewCertManager()
 	err := certMgr.Init(cfg, lg, nil)
 	require.NoError(t, err)
-	is := NewInfoSyncer(lg)
+	ts.client, err = etcd.InitEtcdClient(ts.lg, cfg, certMgr)
+	require.NoError(t, err)
+	ts.kv = clientv3.NewKV(ts.client)
+
+	is := NewInfoSyncer(lg, ts.client)
 	is.syncConfig = syncConfig{
 		sessionTTL:        1,
 		refreshIntvl:      50 * time.Millisecond,
@@ -293,14 +293,10 @@ func newEtcdTestSuite(t *testing.T) *etcdTestSuite {
 		getPromRetryCnt:   2,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	err = is.Init(ctx, cfg, certMgr)
+	err = is.Init(ctx, cfg)
 	require.NoError(t, err)
 	ts.is = is
 	ts.cancel = cancel
-
-	ts.client, err = InitEtcdClient(ts.lg, cfg, certMgr)
-	require.NoError(t, err)
-	ts.kv = clientv3.NewKV(ts.client)
 	return ts
 }
 
@@ -386,19 +382,7 @@ func (ts *etcdTestSuite) setPromInfo(info *PrometheusInfo) {
 }
 
 func (ts *etcdTestSuite) createEtcdServer(addr string) {
-	etcd, err := CreateEtcdServer(addr, ts.t.TempDir(), ts.lg)
+	etcd, err := etcd.CreateEtcdServer(addr, ts.t.TempDir(), ts.lg)
 	require.NoError(ts.t, err)
 	ts.server = etcd
-}
-
-func newConfig(endpoint string) *config.Config {
-	return &config.Config{
-		Proxy: config.ProxyServer{
-			Addr:    "0.0.0.0:6000",
-			PDAddrs: endpoint,
-		},
-		API: config.API{
-			Addr: "0.0.0.0:3080",
-		},
-	}
 }
