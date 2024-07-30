@@ -50,13 +50,21 @@ var (
 			if len(pairs) < 2 {
 				return model.SampleValue(math.NaN())
 			}
-			pair1 := pairs[len(pairs)-2]
-			pair2 := pairs[len(pairs)-1]
-			timeDiff := float64(pair2.Timestamp-pair1.Timestamp) / 1000.0
-			if timeDiff < 1e-4 {
-				return model.SampleValue(math.NaN())
+			lastPair := pairs[len(pairs)-1]
+			for i := len(pairs) - 2; i >= 0; i-- {
+				pair := pairs[i]
+				// Skip this one if the interval is too short.
+				seconds := float64(lastPair.Timestamp-pair.Timestamp) / 1000.0
+				if seconds < 1 {
+					continue
+				}
+				// Maybe the backend just rebooted.
+				if pair.Value > lastPair.Value {
+					return model.SampleValue(math.NaN())
+				}
+				return (lastPair.Value - pair.Value) / model.SampleValue(seconds)
 			}
-			return (pair2.Value - pair1.Value) / model.SampleValue(timeDiff)
+			return model.SampleValue(math.NaN())
 		},
 		ResultType: model.ValMatrix,
 	}
@@ -80,17 +88,17 @@ type FactorCPU struct {
 	// The estimated average CPU usage used by one connection.
 	usagePerConn float64
 	mr           metricsreader.MetricsReader
-	queryID      uint64
 	bitNum       int
 }
 
 func NewFactorCPU(mr metricsreader.MetricsReader) *FactorCPU {
-	return &FactorCPU{
+	fc := &FactorCPU{
 		mr:       mr,
-		queryID:  mr.AddQueryExpr(cpuQueryExpr),
 		bitNum:   5,
 		snapshot: make(map[string]cpuBackendSnapshot),
 	}
+	mr.AddQueryExpr(fc.Name(), cpuQueryExpr, cpuQueryRule)
+	return fc
 }
 
 func (fc *FactorCPU) Name() string {
@@ -101,8 +109,8 @@ func (fc *FactorCPU) UpdateScore(backends []scoredBackend) {
 	if len(backends) <= 1 {
 		return
 	}
-	qr := fc.mr.GetQueryResult(fc.queryID)
-	if qr.Err != nil || qr.Empty() {
+	qr := fc.mr.GetQueryResult(fc.Name())
+	if qr.Empty() {
 		return
 	}
 
@@ -250,5 +258,5 @@ func (fc *FactorCPU) SetConfig(cfg *config.Config) {
 }
 
 func (fc *FactorCPU) Close() {
-	fc.mr.RemoveQueryExpr(fc.queryID)
+	fc.mr.RemoveQueryExpr(fc.Name())
 }

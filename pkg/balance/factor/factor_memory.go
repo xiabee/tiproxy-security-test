@@ -100,7 +100,6 @@ type FactorMemory struct {
 	// The updated time of the metric that we've read last time.
 	lastMetricTime monotime.Time
 	mr             metricsreader.MetricsReader
-	queryID        uint64
 	bitNum         int
 }
 
@@ -112,12 +111,13 @@ func NewFactorMemory(mr metricsreader.MetricsReader) *FactorMemory {
 		}
 		levels = levels >> 1
 	}
-	return &FactorMemory{
+	fm := &FactorMemory{
 		mr:       mr,
-		queryID:  mr.AddQueryExpr(memQueryExpr),
 		bitNum:   bitNum,
 		snapshot: make(map[string]memBackendSnapshot),
 	}
+	mr.AddQueryExpr(fm.Name(), memQueryExpr, memoryQueryRule)
+	return fm
 }
 
 func (fm *FactorMemory) Name() string {
@@ -128,8 +128,8 @@ func (fm *FactorMemory) UpdateScore(backends []scoredBackend) {
 	if len(backends) <= 1 {
 		return
 	}
-	qr := fm.mr.GetQueryResult(fm.queryID)
-	if qr.Err != nil || qr.Empty() {
+	qr := fm.mr.GetQueryResult(fm.Name())
+	if qr.Empty() {
 		return
 	}
 
@@ -204,9 +204,14 @@ func calcMemUsage(usageHistory []model.SamplePair) (latestUsage float64, timeToO
 			latestUsage = value
 			latestTime = usageHistory[i].Timestamp
 		} else {
-			diff := latestUsage - value
-			if diff > 0.0001 {
-				timeToOOM = time.Duration(float64(latestTime-usageHistory[i].Timestamp)*(oomMemoryUsage-latestUsage)/diff) * time.Millisecond
+			timeDiff := latestTime.Sub(usageHistory[i].Timestamp)
+			if timeDiff < 10*time.Second {
+				// Skip this one is the interval is too short.
+				continue
+			}
+			usageDiff := latestUsage - value
+			if usageDiff > 1e-4 {
+				timeToOOM = timeDiff * time.Duration((oomMemoryUsage-latestUsage)/usageDiff)
 			}
 			break
 		}
@@ -270,5 +275,5 @@ func (fm *FactorMemory) SetConfig(cfg *config.Config) {
 }
 
 func (fm *FactorMemory) Close() {
-	fm.mr.RemoveQueryExpr(fm.queryID)
+	fm.mr.RemoveQueryExpr(fm.Name())
 }

@@ -93,36 +93,31 @@ func (mf *mockFactor) Close() {
 var _ metricsreader.MetricsReader = (*mockMetricsReader)(nil)
 
 type mockMetricsReader struct {
-	queryID uint64
-	qrs     map[uint64]metricsreader.QueryResult
+	qrs map[string]metricsreader.QueryResult
 }
 
 func newMockMetricsReader() *mockMetricsReader {
 	return &mockMetricsReader{
-		qrs: make(map[uint64]metricsreader.QueryResult),
+		qrs: make(map[string]metricsreader.QueryResult),
 	}
 }
 
-func (mmr *mockMetricsReader) Start(ctx context.Context) {
-}
-
-func (mmr *mockMetricsReader) AddQueryExpr(queryExpr metricsreader.QueryExpr) uint64 {
-	mmr.queryID++
-	return mmr.queryID
-}
-
-func (mmr *mockMetricsReader) RemoveQueryExpr(id uint64) {
-}
-
-func (mmr *mockMetricsReader) GetQueryResult(id uint64) metricsreader.QueryResult {
-	return mmr.qrs[id]
-}
-
-func (mmr *mockMetricsReader) Subscribe(receiverName string) <-chan struct{} {
+func (mmr *mockMetricsReader) Start(ctx context.Context) error {
 	return nil
 }
 
-func (mmr *mockMetricsReader) Unsubscribe(receiverName string) {
+func (mmr *mockMetricsReader) AddQueryExpr(key string, queryExpr metricsreader.QueryExpr, queryRule metricsreader.QueryRule) {
+}
+
+func (mmr *mockMetricsReader) RemoveQueryExpr(key string) {
+}
+
+func (mmr *mockMetricsReader) GetQueryResult(key string) metricsreader.QueryResult {
+	return mmr.qrs[key]
+}
+
+func (mmr *mockMetricsReader) GetBackendMetrics() []byte {
+	return nil
 }
 
 func (mmr *mockMetricsReader) Close() {
@@ -153,6 +148,14 @@ func createSampleStream(values []float64, backendIdx int, curTime model.Time) *m
 		pairs = append(pairs, model.SamplePair{Timestamp: ts, Value: model.SampleValue(cpu)})
 	}
 	return &model.SampleStream{Metric: labelSet, Values: pairs}
+}
+
+func createPairs(values []float64, ts []model.Time) []model.SamplePair {
+	pairs := make([]model.SamplePair, 0, len(values))
+	for i, value := range values {
+		pairs = append(pairs, model.SamplePair{Timestamp: ts[i], Value: model.SampleValue(value)})
+	}
+	return pairs
 }
 
 func createSample(value float64, backendIdx int) *model.Sample {

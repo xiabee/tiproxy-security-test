@@ -5,6 +5,8 @@ package metricsreader
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -16,10 +18,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/logger"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
+	httputil "github.com/pingcap/tiproxy/pkg/util/http"
+	"github.com/pingcap/tiproxy/pkg/util/monotime"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
@@ -28,9 +33,10 @@ import (
 // test getBackendAddrs
 func TestGetBackendAddrs(t *testing.T) {
 	tests := []struct {
-		backends map[string]*infosync.TiDBTopologyInfo
-		hasErr   bool
-		expected []string
+		backends     map[string]*infosync.TiDBTopologyInfo
+		excludeZones []string
+		hasErr       bool
+		expected     []string
 	}{
 		{
 			backends: map[string]*infosync.TiDBTopologyInfo{},
@@ -59,13 +65,60 @@ func TestGetBackendAddrs(t *testing.T) {
 			expected: []string{"1.1.1.1:10080", "2.2.2.2:10080"},
 		},
 		{
+			backends: map[string]*infosync.TiDBTopologyInfo{
+				"1.1.1.1:4000": {
+					IP:         "1.1.1.1",
+					StatusPort: 10080,
+					Labels:     map[string]string{config.LocationLabelName: "z1"},
+				},
+				"2.2.2.2:4000": {
+					IP:         "2.2.2.2",
+					StatusPort: 10080,
+					Labels:     map[string]string{config.LocationLabelName: "z2"},
+				},
+			},
+			excludeZones: []string{"z1"},
+			expected:     []string{"2.2.2.2:10080"},
+		},
+		{
+			backends: map[string]*infosync.TiDBTopologyInfo{
+				"1.1.1.1:4000": {
+					IP:         "1.1.1.1",
+					StatusPort: 10080,
+					Labels:     map[string]string{config.LocationLabelName: "z1"},
+				},
+				"2.2.2.2:4000": {
+					IP:         "2.2.2.2",
+					StatusPort: 10080,
+					Labels:     map[string]string{config.LocationLabelName: "z2"},
+				},
+			},
+			excludeZones: []string{"z1", "z2"},
+			expected:     []string{},
+		},
+		{
+			backends: map[string]*infosync.TiDBTopologyInfo{
+				"1.1.1.1:4000": {
+					IP:         "1.1.1.1",
+					StatusPort: 10080,
+				},
+				"2.2.2.2:4000": {
+					IP:         "2.2.2.2",
+					StatusPort: 10080,
+					Labels:     map[string]string{config.LocationLabelName: "z2"},
+				},
+			},
+			excludeZones: []string{"z1", "z2"},
+			expected:     []string{"1.1.1.1:10080"},
+		},
+		{
 			hasErr: true,
 		},
 	}
 
 	lg, _ := logger.CreateLoggerForTest(t)
 	fetcher := newMockBackendFetcher(nil, nil)
-	br := NewBackendReader(lg, nil, nil, fetcher, nil)
+	br := NewBackendReader(lg, nil, nil, nil, fetcher, nil)
 	for i, test := range tests {
 		fetcher.infos = test.backends
 		if test.hasErr {
@@ -73,7 +126,7 @@ func TestGetBackendAddrs(t *testing.T) {
 		} else {
 			fetcher.err = nil
 		}
-		addrs, err := br.getBackendAddrs(context.Background())
+		addrs, err := br.getBackendAddrs(context.Background(), test.excludeZones)
 		if test.hasErr {
 			require.Error(t, err, "case %d", i)
 		} else {
@@ -180,7 +233,8 @@ func TestReadBackendMetric(t *testing.T) {
 	port := httpHandler.Start()
 	t.Cleanup(httpHandler.Close)
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-	br := NewBackendReader(lg, nil, http.DefaultClient, nil, cfg)
+	cli := httputil.NewHTTPClient(func() *tls.Config { return nil })
+	br := NewBackendReader(lg, nil, cli, nil, nil, cfg)
 	for i, test := range tests {
 		statusCode := http.StatusOK
 		if test.hasErr {
@@ -201,7 +255,7 @@ func TestReadBackendMetric(t *testing.T) {
 	}
 }
 
-// test groupMetricsByRule
+// test metric2History and history2Value
 func TestOneRuleOneHistory(t *testing.T) {
 	tests := []struct {
 		names      []string
@@ -238,7 +292,7 @@ func TestOneRuleOneHistory(t *testing.T) {
 	mfs := mockMfs()
 	lg, _ := logger.CreateLoggerForTest(t)
 	for i, test := range tests {
-		br := NewBackendReader(lg, nil, nil, nil, nil)
+		br := NewBackendReader(lg, nil, nil, nil, nil, nil)
 		br.queryRules = map[string]QueryRule{
 			"key": {
 				Names: test.names,
@@ -252,7 +306,8 @@ func TestOneRuleOneHistory(t *testing.T) {
 			},
 		}
 
-		res := br.groupMetricsByRule(mfs, "backend")
+		br.metric2History(mfs, "backend")
+		res := br.history2Value("backend")
 		value := res["key"]
 		switch test.returnType {
 		case model.ValVector:
@@ -276,7 +331,7 @@ func TestOneRuleOneHistory(t *testing.T) {
 	}
 }
 
-// test groupMetricsByRule
+// test metric2History and history2Value
 func TestOneRuleMultiHistory(t *testing.T) {
 	tests := []struct {
 		step1Value model.SampleValue
@@ -306,7 +361,7 @@ func TestOneRuleMultiHistory(t *testing.T) {
 
 	mfs := mockMfs()
 	lg, _ := logger.CreateLoggerForTest(t)
-	br := NewBackendReader(lg, nil, nil, nil, nil)
+	br := NewBackendReader(lg, nil, nil, nil, nil, nil)
 	var lastTs model.Time
 	var length int
 	for i, test := range tests {
@@ -323,10 +378,10 @@ func TestOneRuleMultiHistory(t *testing.T) {
 			},
 		}
 
-		res := br.groupMetricsByRule(mfs, "backend")
+		br.metric2History(mfs, "backend")
+		res := br.history2Value("backend")
 		value := res["key"]
 		if math.IsNaN(float64(test.step2Value)) {
-			require.Nil(t, value, "case %d", i)
 			continue
 		}
 		length++
@@ -342,7 +397,7 @@ func TestOneRuleMultiHistory(t *testing.T) {
 	}
 }
 
-// test groupMetricsByRule
+// test metric2History and history2Value
 func TestMultiRules(t *testing.T) {
 	returnedValues := []model.SampleValue{model.SampleValue(1), model.SampleValue(2)}
 	rule1 := QueryRule{
@@ -389,7 +444,7 @@ func TestMultiRules(t *testing.T) {
 
 	mfs := mockMfs()
 	lg, _ := logger.CreateLoggerForTest(t)
-	br := NewBackendReader(lg, nil, nil, nil, nil)
+	br := NewBackendReader(lg, nil, nil, nil, nil, nil)
 	for i, test := range tests {
 		if test.hasRule1 {
 			br.queryRules["key1"] = rule1
@@ -403,7 +458,8 @@ func TestMultiRules(t *testing.T) {
 		} else {
 			delete(br.queryRules, "key2")
 		}
-		res := br.groupMetricsByRule(mfs, "backend")
+		br.metric2History(mfs, "backend")
+		res := br.history2Value("backend")
 		require.Len(t, res, len(br.queryRules), "case %d", i)
 
 		if test.hasRule1 {
@@ -490,7 +546,7 @@ func TestMergeQueryResult(t *testing.T) {
 	}
 
 	lg, _ := logger.CreateLoggerForTest(t)
-	br := NewBackendReader(lg, nil, nil, nil, nil)
+	br := NewBackendReader(lg, nil, nil, nil, nil, nil)
 	for i, test := range tests {
 		br.mergeQueryResult(test.backendValues, test.backend)
 		for id, expectedValue := range test.queryResult {
@@ -518,6 +574,180 @@ func TestMergeQueryResult(t *testing.T) {
 				require.Equal(t, expectedValue.(model.Matrix)[0], sample, "case %d", i)
 			}
 		}
+	}
+}
+
+func TestMergeHistory(t *testing.T) {
+	tests := []struct {
+		oldHistory map[string]map[string]backendHistory
+		newHistory map[string]map[string]backendHistory
+		result     map[string]map[string]backendHistory
+	}{
+		{
+			oldHistory: map[string]map[string]backendHistory{},
+			result:     map[string]map[string]backendHistory{},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{},
+			newHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			newHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend2": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+					"backend2": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+					"backend2": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			newHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend2": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+					"backend2": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			newHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+		},
+		{
+			oldHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+			newHistory: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 1}, {Value: 2, Timestamp: 2}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 3}, {Value: 4, Timestamp: 4}},
+					},
+				},
+			},
+			result: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{{Value: 1, Timestamp: 10}, {Value: 2, Timestamp: 20}},
+						Step2History: []model.SamplePair{{Value: 3, Timestamp: 30}, {Value: 4, Timestamp: 40}},
+					},
+				},
+			},
+		},
+	}
+
+	lg, _ := logger.CreateLoggerForTest(t)
+	br := NewBackendReader(lg, nil, nil, nil, nil, nil)
+	for i, test := range tests {
+		br.history = test.oldHistory
+		br.mergeHistory(test.newHistory)
+		require.Equal(t, test.result, br.history, "case %d", i)
 	}
 }
 
@@ -566,7 +796,7 @@ func TestPurgeHistory(t *testing.T) {
 	}
 
 	lg, _ := logger.CreateLoggerForTest(t)
-	br := NewBackendReader(lg, nil, nil, nil, nil)
+	br := NewBackendReader(lg, nil, nil, nil, nil, nil)
 	for i, test := range tests {
 		br.AddQueryRule(strconv.Itoa(i), QueryRule{
 			Retention: time.Minute,
@@ -614,7 +844,8 @@ func TestQueryBackendConcurrently(t *testing.T) {
 	})
 
 	fetcher := newMockBackendFetcher(infos, nil)
-	br := NewBackendReader(lg, nil, http.DefaultClient, fetcher, cfg)
+	cli := httputil.NewHTTPClient(func() *tls.Config { return nil })
+	br := NewBackendReader(lg, nil, cli, nil, fetcher, cfg)
 	// create 3 rules
 	addRule := func(id int) {
 		rule := QueryRule{
@@ -644,11 +875,11 @@ func TestQueryBackendConcurrently(t *testing.T) {
 	var wg waitgroup.WaitGroup
 	childCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	// fill the initial query result to ensure the result is always non-empty
-	err := br.readFromBackends(childCtx)
+	err := br.readFromBackends(childCtx, nil)
 	require.NoError(t, err)
 	wg.Run(func() {
 		for childCtx.Err() == nil {
-			err := br.readFromBackends(childCtx)
+			err := br.readFromBackends(childCtx, nil)
 			require.NoError(t, err)
 			br.purgeHistory()
 		}
@@ -702,8 +933,7 @@ func TestQueryBackendConcurrently(t *testing.T) {
 		for childCtx.Err() == nil {
 			select {
 			case <-time.After(10 * time.Millisecond):
-				_, err := br.GetBackendMetrics()
-				require.NoError(t, err)
+				br.GetBackendMetrics()
 			case <-childCtx.Done():
 				return
 			}
@@ -715,15 +945,48 @@ func TestQueryBackendConcurrently(t *testing.T) {
 
 func TestReadFromOwner(t *testing.T) {
 	tests := []struct {
-		history    map[string]map[string]backendHistory
-		statusCode int32
+		history  map[string]map[string]backendHistory
+		expected map[string]map[string]backendHistory
+		backends []string
 	}{
 		{
-			history:    make(map[string]map[string]backendHistory),
-			statusCode: http.StatusOK,
+			history:  make(map[string]map[string]backendHistory),
+			expected: make(map[string]map[string]backendHistory),
+			backends: []string{},
 		},
 		{
 			history: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 100.0},
+							{Timestamp: 234, Value: 200.0},
+						},
+						Step2History: []model.SamplePair{
+							{Timestamp: 123, Value: 200.0},
+							{Timestamp: 234, Value: 300.0},
+						},
+					},
+					"backend2": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 400.0},
+						},
+					},
+					"backend3": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 400.0},
+						},
+					},
+				},
+				"rule_id2": {
+					"backend1": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 500.0},
+						},
+					},
+				},
+			},
+			expected: map[string]map[string]backendHistory{
 				"rule_id1": {
 					"backend1": {
 						Step1History: []model.SamplePair{
@@ -749,17 +1012,37 @@ func TestReadFromOwner(t *testing.T) {
 					},
 				},
 			},
-			statusCode: http.StatusOK,
+			backends: []string{"backend1", "backend2"},
 		},
 		{
-			history:    make(map[string]map[string]backendHistory),
-			statusCode: http.StatusNotFound,
+			history: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 100.0},
+							{Timestamp: 234, Value: 200.0},
+						},
+					},
+				},
+			},
+			expected: map[string]map[string]backendHistory{
+				"rule_id1": {
+					"backend1": {
+						Step1History: []model.SamplePair{
+							{Timestamp: 123, Value: 100.0},
+							{Timestamp: 234, Value: 200.0},
+						},
+					},
+				},
+			},
+			backends: []string{"backend1", "backend2"},
 		},
 	}
 
 	lg, _ := logger.CreateLoggerForTest(t)
 	cfg := newHealthCheckConfigForTest()
-	br := NewBackendReader(lg, nil, http.DefaultClient, nil, cfg)
+	cli := httputil.NewHTTPClient(func() *tls.Config { return nil })
+	br := NewBackendReader(lg, nil, cli, nil, nil, cfg)
 	httpHandler := newMockHttpHandler(t)
 	port := httpHandler.Start()
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
@@ -768,29 +1051,241 @@ func TestReadFromOwner(t *testing.T) {
 	for i, test := range tests {
 		// marshal
 		br.history = test.history
-		br.marshalledHistory = nil
-		data, err := br.GetBackendMetrics()
+		err := br.marshalHistory(test.backends)
 		require.NoError(t, err, "case %d", i)
+		data := br.GetBackendMetrics()
 
 		f := func(_ string) string {
 			return string(data)
 		}
 		httpHandler.getRespBody.Store(&f)
-		httpHandler.statusCode.Store(test.statusCode)
 
 		// unmarshal
 		br.history = make(map[string]map[string]backendHistory)
 		err = br.readFromOwner(context.Background(), addr)
-		if test.statusCode != http.StatusOK {
-			require.Error(t, err, "case %d", i)
-			continue
-		}
 		require.NoError(t, err, "case %d", i)
-		require.Equal(t, test.history, br.history, "case %d", i)
+		require.Equal(t, test.expected, br.history, "case %d", i)
 
 		// marshal again
-		data2, err := br.GetBackendMetrics()
-		require.NoError(t, err, "case %d", i)
+		data2 := br.GetBackendMetrics()
 		require.Equal(t, data, data2, "case %d", i)
 	}
+}
+
+// test queryAllOwners
+func TestQueryAllOwners(t *testing.T) {
+	tests := []struct {
+		keys   []string
+		values []string
+		owners []string
+		zones  []string
+	}{
+		{},
+		{
+			keys:   []string{"/owner/1111", "/owner/2222"},
+			values: []string{"backend1", "backend2"},
+			owners: []string{"backend1"},
+		},
+		{
+			keys:   []string{"/east/owner/1111", "/east/owner/2222"},
+			values: []string{"backend1", "backend2"},
+			owners: []string{"backend1"},
+			zones:  []string{"east"},
+		},
+		{
+			keys:   []string{"/east/owner/1111", "/west/owner/2222"},
+			values: []string{"backend1", "backend2"},
+			owners: []string{"backend1", "backend2"},
+			zones:  []string{"east", "west"},
+		},
+		{
+			keys:   []string{"/east/owner/1111", "/owner/2222"},
+			values: []string{"backend1", "backend2"},
+			owners: []string{"backend1", "backend2"},
+			zones:  []string{"east"},
+		},
+		{
+			keys:   []string{"/east/owner/1111", "/owner/2222"},
+			values: []string{"backend1", "backend1"},
+			owners: []string{"backend1"},
+			zones:  []string{"east"},
+		},
+		{
+			keys:   []string{"", "//owner/2222", "/east/3333"},
+			values: []string{"backend1", "backend2", "backend3"},
+		},
+	}
+
+	lg, _ := logger.CreateLoggerForTest(t)
+	suite := newEtcdTestSuite(t)
+	defer suite.close()
+	br := NewBackendReader(lg, nil, nil, suite.client, nil, nil)
+	for i, test := range tests {
+		for i, key := range test.keys {
+			key = fmt.Sprintf("%s%s", readerOwnerKeyPrefix, key)
+			suite.putKV(key, test.values[i])
+		}
+		zones, owners, err := br.queryAllOwners(context.Background())
+		require.NoError(t, err, "case %d", i)
+		if test.owners == nil {
+			require.Empty(t, owners, "case %d", i)
+		} else {
+			slices.Sort(owners)
+			require.Equal(t, test.owners, owners, "case %d", i)
+		}
+		if test.zones == nil {
+			require.Empty(t, zones, "case %d", i)
+		} else {
+			slices.Sort(zones)
+			require.Equal(t, test.zones, zones, "case %d", i)
+		}
+		suite.delKV(readerOwnerKeyPrefix)
+	}
+}
+
+func TestUpdateLabel(t *testing.T) {
+	lg, _ := logger.CreateLoggerForTest(t)
+	suite := newEtcdTestSuite(t)
+	defer suite.close()
+	cfg := config.NewConfig()
+	cfgGetter := newMockConfigGetter(cfg)
+	healthCfg := newHealthCheckConfigForTest()
+	fetcher := newMockBackendFetcher(map[string]*infosync.TiDBTopologyInfo{}, nil)
+	br := NewBackendReader(lg, cfgGetter, nil, suite.client, fetcher, healthCfg)
+	err := br.Start(context.Background())
+	require.NoError(t, err)
+	defer br.Close()
+
+	checkKeyPrefix := func(prefix string) bool {
+		kvs := suite.getKV(readerOwnerKeyPrefix)
+		if len(kvs) != 1 {
+			return false
+		}
+		return strings.HasPrefix(string(kvs[0].Key), prefix)
+	}
+
+	// campaign for the global owner
+	prefix := fmt.Sprintf("%s/%s", readerOwnerKeyPrefix, readerOwnerKeySuffix)
+	require.Eventually(t, func() bool {
+		return checkKeyPrefix(prefix)
+	}, 3*time.Second, 10*time.Millisecond)
+
+	// retire the global owner and campaign for the zonal owner
+	cfg.Labels = map[string]string{config.LocationLabelName: "east"}
+	err = br.ReadMetrics(context.Background())
+	require.NoError(t, err)
+	prefix = fmt.Sprintf("%s/east/%s", readerOwnerKeyPrefix, readerOwnerKeySuffix)
+	require.Eventually(t, func() bool {
+		return checkKeyPrefix(prefix)
+	}, 3*time.Second, 10*time.Millisecond)
+}
+
+func TestElection(t *testing.T) {
+	// setup backend
+	backendPort, infos := setupTypicalBackendListener(t, "cpu 80.0\n")
+
+	// setup history
+	now := model.Time(time.Now().UnixMilli())
+	backendKey := net.JoinHostPort("127.0.0.1", strconv.Itoa(backendPort))
+	history := map[string]map[string]backendHistory{
+		"rule_id1": {
+			backendKey: {
+				Step1History: []model.SamplePair{
+					{Timestamp: now, Value: 100.0},
+				},
+				Step2History: []model.SamplePair{
+					{Timestamp: now, Value: 100.0},
+				},
+			},
+		},
+	}
+	hitoryText, err := json.Marshal(history)
+	require.NoError(t, err)
+
+	// setup rule
+	rule := QueryRule{
+		Names:     []string{"cpu"},
+		Retention: time.Minute,
+		Metric2Value: func(mfs map[string]*dto.MetricFamily) model.SampleValue {
+			return model.SampleValue(*mfs["cpu"].Metric[0].Untyped.Value)
+		},
+		Range2Value: func(pairs []model.SamplePair) model.SampleValue {
+			return pairs[len(pairs)-1].Value
+		},
+		ResultType: model.ValVector,
+	}
+
+	// setup owner listener
+	ownerHttpHandler := newMockHttpHandler(t)
+	ownerPort := ownerHttpHandler.Start()
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(ownerPort))
+	ownerFunc := func(_ string) string {
+		return string(hitoryText)
+	}
+	ownerHttpHandler.getRespBody.Store(&ownerFunc)
+	t.Cleanup(ownerHttpHandler.Close)
+
+	// setup etcd
+	suite := newEtcdTestSuite(t)
+	t.Cleanup(suite.close)
+	ownerKey := fmt.Sprintf("%s/%s", readerOwnerKeyPrefix, readerOwnerKeySuffix)
+	suite.putKV(ownerKey, addr)
+	require.Eventually(t, func() bool {
+		kvs := suite.getKV(ownerKey)
+		return len(kvs) == 1 && string(kvs[0].Value) == addr
+	}, 3*time.Second, 10*time.Millisecond)
+
+	// setup backend reader
+	lg, _ := logger.CreateLoggerForTest(t)
+	healthCfg := newHealthCheckConfigForTest()
+	cfg := config.NewConfig()
+	cfgGetter := newMockConfigGetter(cfg)
+	fetcher := newMockBackendFetcher(infos, nil)
+	httpCli := httputil.NewHTTPClient(func() *tls.Config { return nil })
+	br := NewBackendReader(lg, cfgGetter, httpCli, suite.client, fetcher, healthCfg)
+	err = br.Start(context.Background())
+	require.NoError(t, err)
+	br.AddQueryRule("rule_id1", rule)
+	t.Cleanup(br.Close)
+
+	// test not owner
+	ts := monotime.Now()
+	err = br.ReadMetrics(context.Background())
+	require.NoError(t, err)
+	qr := br.GetQueryResult("rule_id1")
+	require.False(t, qr.Empty())
+	require.Equal(t, model.SampleValue(100.0), qr.Value.(model.Vector)[0].Value)
+	require.GreaterOrEqual(t, qr.UpdateTime, ts)
+	ts = qr.UpdateTime
+
+	// test owner
+	suite.delKV(ownerKey)
+	require.Eventually(t, func() bool {
+		kvs := suite.getKV(ownerKey)
+		return len(kvs) == 1 && strings.HasSuffix(string(kvs[0].Value), "3080")
+	}, 3*time.Second, 10*time.Millisecond)
+	err = br.ReadMetrics(context.Background())
+	require.NoError(t, err)
+	qr = br.GetQueryResult("rule_id1")
+	require.False(t, qr.Empty())
+	require.Equal(t, model.SampleValue(80.0), qr.Value.(model.Vector)[0].Value)
+	require.GreaterOrEqual(t, qr.UpdateTime, ts)
+}
+
+func setupTypicalBackendListener(t *testing.T, respBody string) (backendPort int, infos map[string]*infosync.TiDBTopologyInfo) {
+	// setup backend listener
+	backendHttpHandler := newMockHttpHandler(t)
+	backendFunc := func(reqBody string) string {
+		return respBody
+	}
+	backendHttpHandler.getRespBody.Store(&backendFunc)
+	backendPort = backendHttpHandler.Start()
+	infos = map[string]*infosync.TiDBTopologyInfo{
+		"127.0.0.1:4000": {
+			IP:         "127.0.0.1",
+			StatusPort: uint(backendPort),
+		},
+	}
+	t.Cleanup(backendHttpHandler.Close)
+	return
 }
