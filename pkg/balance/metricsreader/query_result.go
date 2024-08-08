@@ -5,12 +5,12 @@ package metricsreader
 
 import (
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/pingcap/tiproxy/pkg/balance/policy"
-	"github.com/pingcap/tiproxy/pkg/util/monotime"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
@@ -53,11 +53,11 @@ type QueryRule struct {
 
 type QueryResult struct {
 	Value      model.Value
-	UpdateTime monotime.Time
+	UpdateTime time.Time
 }
 
 func (qr QueryResult) Empty() bool {
-	if qr.Value == nil {
+	if qr.Value == nil || reflect.ValueOf(qr.Value).IsNil() {
 		return true
 	}
 	switch qr.Value.Type() {
@@ -77,7 +77,7 @@ func (qr QueryResult) Empty() bool {
 
 // GetSamplePair4Backend returns metric of a backend from a matrix.
 func (qr QueryResult) GetSamplePair4Backend(backend policy.BackendCtx) []model.SamplePair {
-	if qr.Value == nil {
+	if qr.Value == nil || reflect.ValueOf(qr.Value).IsNil() {
 		return nil
 	}
 	if qr.Value.Type() != model.ValMatrix {
@@ -97,7 +97,7 @@ func (qr QueryResult) GetSamplePair4Backend(backend policy.BackendCtx) []model.S
 
 // GetSample4Backend returns metric of a backend from a vector.
 func (qr QueryResult) GetSample4Backend(backend policy.BackendCtx) *model.Sample {
-	if qr.Value == nil {
+	if qr.Value == nil || reflect.ValueOf(qr.Value).IsNil() {
 		return nil
 	}
 	if qr.Value.Type() != model.ValVector {

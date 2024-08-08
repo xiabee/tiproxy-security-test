@@ -15,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -25,7 +24,6 @@ import (
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
 	"github.com/pingcap/tiproxy/pkg/balance/router"
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
-	"github.com/pingcap/tiproxy/pkg/util/monotime"
 	"github.com/siddontang/go/hack"
 	"go.uber.org/zap"
 )
@@ -124,7 +122,7 @@ type BackendConnManager struct {
 	signalReceived chan signalType
 	authenticator  *Authenticator
 	cmdProcessor   *CmdProcessor
-	eventReceiver  unsafe.Pointer
+	eventReceiver  atomic.Pointer[router.ConnEventReceiver]
 	config         *BCConfig
 	logger         *zap.Logger
 	curBackend     router.BackendInst
@@ -135,7 +133,7 @@ type BackendConnManager struct {
 	// GracefulClose() sets it without lock.
 	closeStatus atomic.Int32
 	// The last time when the backend is active.
-	lastActiveTime monotime.Time
+	lastActiveTime time.Time
 	// The traffic recorded last time.
 	inBytes, inPackets, outBytes, outPackets uint64
 	// cancelFunc is used to cancel the signal processing goroutine.
@@ -191,7 +189,7 @@ func (mgr *BackendConnManager) Connect(ctx context.Context, clientIO *pnet.Packe
 		mgr.quitSource = SrcProxyQuit
 		return errors.New("graceful shutdown before connecting")
 	}
-	startTime := monotime.Now()
+	startTime := time.Now()
 	err := mgr.authenticator.handshakeFirstTime(ctx, mgr.logger.Named("authenticator"), mgr, clientIO, mgr.handshakeHandler, mgr.getBackendIO, frontendTLSConfig, backendTLSConfig)
 	if err != nil {
 		src := Error2Source(err)
@@ -204,8 +202,8 @@ func (mgr *BackendConnManager) Connect(ctx context.Context, clientIO *pnet.Packe
 		return err
 	}
 	mgr.handshakeHandler.OnHandshake(mgr, mgr.ServerAddr(), nil, SrcNone)
-	endTime := monotime.Now()
-	addHandshakeMetrics(mgr.ServerAddr(), time.Duration(endTime-startTime))
+	endTime := time.Now()
+	addHandshakeMetrics(mgr.ServerAddr(), endTime.Sub(startTime))
 	mgr.updateTraffic(mgr.backendIO.Load())
 
 	mgr.cmdProcessor.capability = mgr.authenticator.capability
@@ -246,7 +244,7 @@ func (mgr *BackendConnManager) getBackendIO(ctx context.Context, cctx ConnContex
 	// - One TiDB may be just shut down and another is just started but not ready yet
 	bctx, cancel := context.WithTimeout(ctx, mgr.config.ConnectTimeout)
 	selector := r.GetBackendSelector()
-	startTime := monotime.Now()
+	startTime := time.Now()
 	var addr string
 	var backend router.BackendInst
 	var origErr error
@@ -285,7 +283,7 @@ func (mgr *BackendConnManager) getBackendIO(ctx context.Context, cctx ConnContex
 	)
 	cancel()
 
-	duration := monotime.Since(startTime)
+	duration := time.Since(startTime)
 	addGetBackendMetrics(duration, err == nil)
 	if err != nil {
 		mgr.logger.Error("get backend failed", zap.Duration("duration", duration), zap.NamedError("last_err", origErr))
@@ -304,12 +302,12 @@ func (mgr *BackendConnManager) getBackendIO(ctx context.Context, cctx ConnContex
 // ExecuteCmd forwards messages between the client and the backend.
 // If it finds that the session is ready for redirection, it migrates the session.
 func (mgr *BackendConnManager) ExecuteCmd(ctx context.Context, request []byte) (err error) {
-	startTime := monotime.Now()
+	startTime := time.Now()
 	mgr.processLock.Lock()
 	defer func() {
 		mgr.setQuitSourceByErr(err)
 		mgr.handshakeHandler.OnTraffic(mgr)
-		now := monotime.Now()
+		now := time.Now()
 		if err != nil && errors.Is(err, ErrBackendConn) {
 			cmd, data := pnet.Command(request[0]), request[1:]
 			var query string
@@ -321,8 +319,8 @@ func (mgr *BackendConnManager) ExecuteCmd(ctx context.Context, request []byte) (
 			}
 			// idle_time: maybe the idle time exceeds wait_timeout?
 			// execute_time and query: maybe this query causes TiDB OOM?
-			mgr.logger.Info("backend disconnects", zap.Duration("idle_time", time.Duration(now-mgr.lastActiveTime)),
-				zap.Duration("execute_time", time.Duration(now-startTime)), zap.Stringer("cmd", cmd), zap.String("query", query))
+			mgr.logger.Info("backend disconnects", zap.Duration("idle_time", now.Sub(mgr.lastActiveTime)),
+				zap.Duration("execute_time", now.Sub(startTime)), zap.Stringer("cmd", cmd), zap.String("query", query))
 		}
 		mgr.lastActiveTime = now
 		mgr.processLock.Unlock()
@@ -407,11 +405,11 @@ func (mgr *BackendConnManager) updateTraffic(backendIO *pnet.PacketIO) {
 // SetEventReceiver implements RedirectableConn.SetEventReceiver interface.
 // The receiver sends redirection signals and watches redirecting events.
 func (mgr *BackendConnManager) SetEventReceiver(receiver router.ConnEventReceiver) {
-	atomic.StorePointer(&mgr.eventReceiver, unsafe.Pointer(&receiver))
+	mgr.eventReceiver.Store(&receiver)
 }
 
 func (mgr *BackendConnManager) getEventReceiver() router.ConnEventReceiver {
-	eventReceiver := (*router.ConnEventReceiver)(atomic.LoadPointer(&mgr.eventReceiver))
+	eventReceiver := mgr.eventReceiver.Load()
 	if eventReceiver == nil {
 		return nil
 	}
@@ -635,7 +633,7 @@ func (mgr *BackendConnManager) checkBackendActive() {
 	if mgr.closeStatus.Load() >= statusNotifyClose {
 		return
 	}
-	now := monotime.Now()
+	now := time.Now()
 	if mgr.lastActiveTime.Add(mgr.config.CheckBackendInterval).After(now) {
 		return
 	}

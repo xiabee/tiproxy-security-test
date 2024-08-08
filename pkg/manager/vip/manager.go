@@ -6,6 +6,7 @@ package vip
 import (
 	"context"
 	"net"
+	"sync/atomic"
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/pkg/manager/elect"
@@ -17,23 +18,25 @@ const (
 	// vipKey is the key in etcd for VIP election.
 	vipKey = "/tiproxy/vip/owner"
 	// sessionTTL is the session's TTL in seconds for VIP election.
-	sessionTTL = 5
+	// The etcd client keeps alive every TTL/3 seconds.
+	// The TTL determines the failover time so it should be short.
+	sessionTTL = 3
 )
 
 type VIPManager interface {
 	Start(context.Context, *clientv3.Client) error
-	OnElected()
-	OnRetired()
+	Resign()
 	Close()
 }
 
 var _ VIPManager = (*vipManager)(nil)
 
 type vipManager struct {
-	operation NetworkOperation
-	cfgGetter config.ConfigGetter
-	election  elect.Election
-	lg        *zap.Logger
+	operation   NetworkOperation
+	cfgGetter   config.ConfigGetter
+	election    elect.Election
+	delOnRetire atomic.Bool
+	lg          *zap.Logger
 }
 
 func NewVIPManager(lg *zap.Logger, cfgGetter config.ConfigGetter) (*vipManager, error) {
@@ -55,6 +58,7 @@ func NewVIPManager(lg *zap.Logger, cfgGetter config.ConfigGetter) (*vipManager, 
 		return nil, err
 	}
 	vm.operation = operation
+	vm.delOnRetire.Store(true)
 	return vm, nil
 }
 
@@ -67,27 +71,29 @@ func (vm *vipManager) Start(ctx context.Context, etcdCli *clientv3.Client) error
 
 	id := net.JoinHostPort(ip, port)
 	electionCfg := elect.DefaultElectionConfig(sessionTTL)
-	election := elect.NewElection(vm.lg, etcdCli, electionCfg, id, vipKey, vm)
-	vm.election = election
-	// Check the ownership at startup just in case the node is just down and restarted.
-	// Before it was down, it may be either the owner or not.
-	if election.IsOwner() {
-		vm.OnElected()
-	} else {
-		vm.OnRetired()
-	}
+	vm.election = elect.NewElection(vm.lg.Named("elect"), etcdCli, electionCfg, id, vipKey, vm)
 	vm.election.Start(ctx)
 	return nil
 }
 
 func (vm *vipManager) OnElected() {
+	vm.addVIP()
+}
+
+func (vm *vipManager) OnRetired() {
+	if vm.delOnRetire.Load() {
+		vm.delVIP()
+	}
+}
+
+func (vm *vipManager) addVIP() {
 	hasIP, err := vm.operation.HasIP()
 	if err != nil {
 		vm.lg.Error("checking addresses failed", zap.Error(err))
 		return
 	}
 	if hasIP {
-		vm.lg.Info("already has VIP, do nothing")
+		vm.lg.Debug("already has VIP, do nothing")
 		return
 	}
 	if err := vm.operation.AddIP(); err != nil {
@@ -101,14 +107,14 @@ func (vm *vipManager) OnElected() {
 	vm.lg.Info("adding VIP success")
 }
 
-func (vm *vipManager) OnRetired() {
+func (vm *vipManager) delVIP() {
 	hasIP, err := vm.operation.HasIP()
 	if err != nil {
 		vm.lg.Error("checking addresses failed", zap.Error(err))
 		return
 	}
 	if !hasIP {
-		vm.lg.Info("does not have VIP, do nothing")
+		vm.lg.Debug("does not have VIP, do nothing")
 		return
 	}
 	if err := vm.operation.DeleteIP(); err != nil {
@@ -118,9 +124,19 @@ func (vm *vipManager) OnRetired() {
 	vm.lg.Info("deleting VIP success")
 }
 
-func (vm *vipManager) Close() {
-	// The OnRetired() will be called when the election is closed.
+// Resign stops compaign but does not delete the VIP.
+// It's called before graceful wait to avoid that the VIP is deleted before another member adds VIP.
+func (vm *vipManager) Resign() {
+	vm.delOnRetire.Store(false)
 	if vm.election != nil {
 		vm.election.Close()
+		vm.election = nil
 	}
+}
+
+// Close stops compaign and deletes the VIP.
+// It's called after graceful wait to ensure the VIP is finally deleted.
+func (vm *vipManager) Close() {
+	vm.Resign()
+	vm.delVIP()
 }
