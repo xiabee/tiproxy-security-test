@@ -23,6 +23,7 @@ import (
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
 	mgrns "github.com/pingcap/tiproxy/pkg/manager/namespace"
 	"github.com/pingcap/tiproxy/pkg/proxy/proxyprotocol"
+	mgrrp "github.com/pingcap/tiproxy/pkg/sqlreplay/manager"
 	"go.uber.org/atomic"
 	"go.uber.org/ratelimit"
 	"go.uber.org/zap"
@@ -42,11 +43,12 @@ type HTTPHandler interface {
 	RegisterHTTP(c *gin.Engine) error
 }
 
-type managers struct {
-	cfg *mgrcfg.ConfigManager
-	ns  *mgrns.NamespaceManager
-	crt *mgrcrt.CertManager
-	br  BackendReader
+type Managers struct {
+	CfgMgr        *mgrcfg.ConfigManager
+	NsMgr         *mgrns.NamespaceManager
+	CertMgr       *mgrcrt.CertManager
+	BackendReader BackendReader
+	ReplayJobMgr  mgrrp.JobManager
 }
 
 type Server struct {
@@ -56,25 +58,20 @@ type Server struct {
 	ready     *atomic.Bool
 	lg        *zap.Logger
 	grpc      *grpc.Server
-	isClosing func() bool
-	mgr       managers
+	isClosing atomic.Bool
+	mgr       Managers
 }
 
-func NewServer(cfg config.API, lg *zap.Logger,
-	isClosing func() bool,
-	nsmgr *mgrns.NamespaceManager, cfgmgr *mgrcfg.ConfigManager,
-	crtmgr *mgrcrt.CertManager, br BackendReader, handler HTTPHandler,
-	ready *atomic.Bool) (*Server, error) {
+func NewServer(cfg config.API, lg *zap.Logger, mgr Managers, handler HTTPHandler, ready *atomic.Bool) (*Server, error) {
 	grpcOpts := []grpc_zap.Option{
 		grpc_zap.WithLevels(func(code codes.Code) zapcore.Level {
 			return zap.InfoLevel
 		}),
 	}
 	h := &Server{
-		limit:     ratelimit.New(DefAPILimit),
-		ready:     ready,
-		lg:        lg,
-		isClosing: isClosing,
+		limit: ratelimit.New(DefAPILimit),
+		ready: ready,
+		lg:    lg,
 		grpc: grpc.NewServer(
 			grpc_middleware.WithUnaryServerChain(
 				grpc_ctxtags.UnaryServerInterceptor(grpc_ctxtags.WithFieldExtractor(grpc_ctxtags.CodeGenRequestFieldExtractor)),
@@ -85,7 +82,7 @@ func NewServer(cfg config.API, lg *zap.Logger,
 				grpc_zap.StreamServerInterceptor(lg.Named("grpcs"), grpcOpts...),
 			),
 		),
-		mgr: managers{cfgmgr, nsmgr, crtmgr, br},
+		mgr: mgr,
 	}
 
 	var err error
@@ -109,8 +106,8 @@ func NewServer(cfg config.API, lg *zap.Logger,
 		h.attachLogger,
 	)
 
-	h.registerGrpc(engine, cfg, cfgmgr)
-	h.registerAPI(engine.Group("/api"), cfg, nsmgr, cfgmgr)
+	h.registerGrpc(mgr.CfgMgr)
+	h.registerAPI(engine.Group("/api"))
 	// The paths are consistent with other components.
 	h.registerMetrics(engine.Group("metrics"))
 	h.registerDebug(engine.Group("debug"))
@@ -121,7 +118,7 @@ func NewServer(cfg config.API, lg *zap.Logger,
 		}
 	}
 
-	if tlscfg := crtmgr.ServerHTTPTLS(); tlscfg != nil {
+	if tlscfg := mgr.CertMgr.ServerHTTPTLS(); tlscfg != nil {
 		h.listener = tls.NewListener(h.listener, tlscfg)
 	}
 
@@ -191,7 +188,7 @@ func (h *Server) readyState(c *gin.Context) {
 	}
 }
 
-func (h *Server) registerGrpc(g *gin.Engine, cfg config.API, cfgmgr *mgrcfg.ConfigManager) {
+func (h *Server) registerGrpc(cfgmgr *mgrcfg.ConfigManager) {
 	diagnosticspb.RegisterDiagnosticsServer(h.grpc, sysutil.NewDiagnosticsServer(cfgmgr.GetConfig().Log.LogFile.Filename))
 }
 
@@ -205,7 +202,7 @@ func (h *Server) grpcServer(ctx *gin.Context) {
 	}
 }
 
-func (h *Server) registerAPI(g *gin.RouterGroup, cfg config.API, nsmgr *mgrns.NamespaceManager, cfgmgr *mgrcfg.ConfigManager) {
+func (h *Server) registerAPI(g *gin.RouterGroup) {
 	{
 		adminGroup := g.Group("admin")
 		h.registerNamespace(adminGroup.Group("namespace"))
@@ -215,6 +212,11 @@ func (h *Server) registerAPI(g *gin.RouterGroup, cfg config.API, nsmgr *mgrns.Na
 	h.registerMetrics(g.Group("metrics"))
 	h.registerDebug(g.Group("debug"))
 	h.registerBackend(g.Group("backend"))
+	h.registerTraffic(g.Group("traffic"))
+}
+
+func (h *Server) PreClose() {
+	h.isClosing.Store(true)
 }
 
 func (h *Server) Close() error {

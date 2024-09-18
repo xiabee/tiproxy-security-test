@@ -49,7 +49,7 @@ const (
 )
 
 var (
-	errReadFromOwner = errors.New("read metrics from owner failed")
+	errReadMetrics = errors.New("read backend metrics failed")
 )
 
 type backendHistory struct {
@@ -85,17 +85,18 @@ type BackendReader struct {
 func NewBackendReader(lg *zap.Logger, cfgGetter config.ConfigGetter, httpCli *http.Client, etcdCli *clientv3.Client,
 	backendFetcher TopologyFetcher, cfg *config.HealthCheck) *BackendReader {
 	return &BackendReader{
-		queryRules:     make(map[string]QueryRule),
-		queryResults:   make(map[string]QueryResult),
-		history:        make(map[string]map[string]backendHistory),
-		lg:             lg,
-		cfgGetter:      cfgGetter,
-		backendFetcher: backendFetcher,
-		cfg:            cfg,
-		wgp:            waitgroup.NewWaitGroupPool(goPoolSize, goMaxIdle),
-		electionCfg:    elect.DefaultElectionConfig(sessionTTL),
-		etcdCli:        etcdCli,
-		httpCli:        httpCli,
+		queryRules:        make(map[string]QueryRule),
+		queryResults:      make(map[string]QueryResult),
+		history:           make(map[string]map[string]backendHistory),
+		lg:                lg,
+		cfgGetter:         cfgGetter,
+		backendFetcher:    backendFetcher,
+		cfg:               cfg,
+		wgp:               waitgroup.NewWaitGroupPool(goPoolSize, goMaxIdle),
+		electionCfg:       elect.DefaultElectionConfig(sessionTTL),
+		etcdCli:           etcdCli,
+		httpCli:           httpCli,
+		marshalledHistory: []byte{},
 	}
 }
 
@@ -167,7 +168,20 @@ func (br *BackendReader) ReadMetrics(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// If self is a owner, read the backends that are not read by any other owners.
 	var errs []error
+	var backendLabels []string
+	if br.isOwner.Load() {
+		if idx := slices.Index(zones, zone); idx >= 0 {
+			zones = slices.Delete(zones, idx, idx+1)
+		}
+		backendLabels, err = br.readFromBackends(ctx, zones)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	for _, owner := range owners {
 		if owner == br.election.ID() {
 			continue
@@ -177,20 +191,16 @@ func (br *BackendReader) ReadMetrics(ctx context.Context) error {
 		}
 	}
 
-	// If self is a owner, read the backends that are not read by any other owners.
-	if br.isOwner.Load() {
-		if idx := slices.Index(zones, zone); idx >= 0 {
-			zones = slices.Delete(zones, idx, idx+1)
-		}
-		if err := br.readFromBackends(ctx, zones); err != nil {
-			return err
-		}
-	}
-
 	// Purge expired history.
 	br.purgeHistory()
+	// Marshal backend history for other members to query.
+	if err := br.marshalHistory(backendLabels); err != nil {
+		br.lg.Error("marshal backend history failed", zap.Any("addrs", backendLabels), zap.Error(err))
+	}
+	// Generate query result for all backends.
+	br.history2QueryResult()
 	if len(errs) > 0 {
-		return errors.Collect(errReadFromOwner, errs...)
+		return errors.Collect(errReadMetrics, errs...)
 	}
 	return nil
 }
@@ -259,21 +269,25 @@ func (br *BackendReader) queryAllOwners(ctx context.Context) (zones, owners []st
 // 1. In k8s, the zone is not set at startup and then is set by HTTP API, so there may temporarily exist both global and zonal owners.
 // 2. Some backends may not be in the same zone with any owner. E.g. there are only 2 TiProxy in a 3-AZ cluster.
 // In any way, the owner queries the backends that are not queried by other owners.
-func (br *BackendReader) readFromBackends(ctx context.Context, excludeZones []string) error {
+func (br *BackendReader) readFromBackends(ctx context.Context, excludeZones []string) ([]string, error) {
 	addrs, err := br.getBackendAddrs(ctx, excludeZones)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(addrs) == 0 {
-		return nil
+		return nil, nil
 	}
 	allNames := br.collectAllNames()
 	if len(allNames) == 0 {
-		return nil
+		return nil, nil
 	}
 
+	backendLabels := make([]string, 0, len(addrs))
 	for _, addr := range addrs {
-		func(addr string) {
+		backendLabels = append(backendLabels, getLabel4Addr(addr))
+	}
+	for i := range addrs {
+		func(addr, label string) {
 			br.wgp.RunWithRecover(func() {
 				if ctx.Err() != nil {
 					return
@@ -289,17 +303,12 @@ func (br *BackendReader) readFromBackends(ctx context.Context, excludeZones []st
 					br.lg.Warn("parse metrics failed", zap.String("addr", addr), zap.Error(err))
 					return
 				}
-				br.metric2History(mf, addr)
+				br.metric2History(mf, label)
 			}, nil, br.lg)
-		}(addr)
+		}(addrs[i], backendLabels[i])
 	}
 	br.wgp.Wait()
-
-	br.history2QueryResult()
-	if err := br.marshalHistory(addrs); err != nil {
-		br.lg.Error("marshal backend history failed", zap.Any("addrs", addrs), zap.Error(err))
-	}
-	return nil
+	return backendLabels, nil
 }
 
 func (br *BackendReader) collectAllNames() []string {
@@ -469,9 +478,6 @@ func (br *BackendReader) readFromOwner(ctx context.Context, ownerAddr string) er
 
 	// If this instance becomes the owner in the next round, it can reuse the history.
 	br.mergeHistory(newHistory)
-
-	// Generate query result for all backends.
-	br.history2QueryResult()
 	return nil
 }
 
@@ -502,8 +508,6 @@ func (br *BackendReader) mergeHistory(newHistory map[string]map[string]backendHi
 			ruleHistory[backend] = backendHistory
 		}
 	}
-	// avoid that the stale history is returned to other members when it just becomes the owner
-	br.marshalledHistory = nil
 }
 
 // marshalHistory marshals the backends that are read by this owner. The marshaled data will be returned to other members.
@@ -512,12 +516,14 @@ func (br *BackendReader) marshalHistory(backends []string) error {
 	defer br.Unlock()
 
 	filteredHistory := make(map[string]map[string]backendHistory, len(br.queryRules))
-	for ruleKey, ruleHistory := range br.history {
-		filteredRuleHistory := make(map[string]backendHistory, len(backends))
-		filteredHistory[ruleKey] = filteredRuleHistory
-		for backend, backendHistory := range ruleHistory {
-			if slices.Contains(backends, backend) {
-				filteredRuleHistory[backend] = backendHistory
+	if len(backends) > 0 {
+		for ruleKey, ruleHistory := range br.history {
+			filteredRuleHistory := make(map[string]backendHistory, len(backends))
+			filteredHistory[ruleKey] = filteredRuleHistory
+			for backend, backendHistory := range ruleHistory {
+				if slices.Contains(backends, backend) {
+					filteredRuleHistory[backend] = backendHistory
+				}
 			}
 		}
 	}
@@ -546,6 +552,12 @@ func (br *BackendReader) getBackendAddrs(ctx context.Context, excludeZones []str
 		addrs = append(addrs, net.JoinHostPort(backend.IP, strconv.Itoa(int(backend.StatusPort))))
 	}
 	return addrs, nil
+}
+
+func (br *BackendReader) PreClose() {
+	if br.election != nil {
+		br.election.Close()
+	}
 }
 
 func (br *BackendReader) Close() {

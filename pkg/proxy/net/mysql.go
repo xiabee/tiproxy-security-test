@@ -6,6 +6,7 @@ package net
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"net"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -27,16 +28,127 @@ var (
 	Status        = ServerStatusAutocommit
 )
 
-// ParseInitialHandshake parses the initial handshake received from the server.
-func ParseInitialHandshake(data []byte) (Capability, uint64, string) {
-	// skip min version
-	serverVersion := string(data[1 : 1+bytes.IndexByte(data[1:], 0)])
-	pos := 1 + len(serverVersion) + 1
-	connid := binary.LittleEndian.Uint32(data[pos : pos+4])
-	// skip salt first part
-	// skip filter
-	pos += 4 + 8 + 1
+// WriteSwitchRequest writes a switch request to the client. It's only for testing.
+func MakeSwitchRequest(authPlugin string, salt [20]byte) []byte {
+	length := 1 + len(authPlugin) + 1 + len(salt) + 1
+	data := make([]byte, 0, length)
+	// check https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_auth_switch_request.html
+	data = append(data, byte(AuthSwitchHeader))
+	data = append(data, authPlugin...)
+	data = append(data, 0x00)
+	data = append(data, salt[:]...)
+	data = append(data, 0x00)
+	return data
+}
 
+func MakeShaCommand() []byte {
+	return []byte{ShaCommand, FastAuthFail}
+}
+
+func ParseSSLRequestOrHandshakeResp(pkt []byte) bool {
+	capability := Capability(binary.LittleEndian.Uint32(pkt[:4]))
+	return capability&ClientSSL != 0
+}
+
+// WriteErrPacket writes an Error packet.
+func MakeErrPacket(merr *gomysql.MyError) []byte {
+	data := make([]byte, 0, 9+len(merr.Message))
+	data = append(data, ErrHeader.Byte())
+	data = append(data, byte(merr.Code), byte(merr.Code>>8))
+	// ClientProtocol41 is always enabled.
+	data = append(data, '#')
+	data = append(data, merr.State...)
+	data = append(data, merr.Message...)
+	return data
+}
+
+// WriteOKPacket writes an OK packet. It's only for testing.
+func MakeOKPacket(status uint16, header Header) []byte {
+	data := make([]byte, 0, 7)
+	data = append(data, header.Byte())
+	data = append(data, 0, 0)
+	// ClientProtocol41 is always enabled.
+	data = DumpUint16(data, status)
+	data = append(data, 0, 0)
+	return data
+}
+
+// WriteEOFPacket writes an EOF packet. It's only for testing.
+func MakeEOFPacket(status uint16) []byte {
+	data := make([]byte, 0, 5)
+	data = append(data, EOFHeader.Byte())
+	data = append(data, 0, 0)
+	// ClientProtocol41 is always enabled.
+	data = DumpUint16(data, status)
+	return data
+}
+
+// WriteUserError writes an unknown error to the client.
+func MakeUserError(err error) []byte {
+	if err == nil {
+		return nil
+	}
+	myErr := gomysql.NewError(gomysql.ER_UNKNOWN_ERROR, err.Error())
+	return MakeErrPacket(myErr)
+}
+
+type InitialHandshake struct {
+	Salt          [20]byte
+	ServerVersion string
+	AuthPlugin    string
+	ConnID        uint64
+	Capability    Capability
+}
+
+// MakeInitialHandshake creates an initial handshake as a server.
+// It's used for tenant-aware routing and testing.
+func MakeInitialHandshake(capability Capability, salt [20]byte, authPlugin string, serverVersion string, connID uint64) []byte {
+	saltLen := len(salt)
+	data := make([]byte, 0, 128)
+
+	// min version 10
+	data = append(data, 10)
+	// server version[NUL]
+	data = append(data, serverVersion...)
+	data = append(data, 0)
+	// connection id
+	data = append(data, byte(connID), byte(connID>>8), byte(connID>>16), byte(connID>>24))
+	// auth-plugin-data-part-1
+	data = append(data, salt[0:8]...)
+	// filler [00]
+	data = append(data, 0)
+	// capability flag lower 2 bytes, using default capability here
+	data = append(data, byte(capability), byte(capability>>8))
+	// charset
+	data = append(data, Collation)
+	// status
+	data = DumpUint16(data, Status)
+	// capability flag upper 2 bytes, using default capability here
+	data = append(data, byte(capability>>16), byte(capability>>24))
+	// length of auth-plugin-data
+	data = append(data, byte(saltLen+1))
+	// reserved 10 [00]
+	data = append(data, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	// auth-plugin-data-part-2
+	data = append(data, salt[8:saltLen]...)
+	data = append(data, 0)
+	// auth-plugin name
+	data = append(data, []byte(authPlugin)...)
+	data = append(data, 0)
+	return data
+}
+
+// ParseInitialHandshake parses the initial handshake received from the server.
+func ParseInitialHandshake(data []byte) *InitialHandshake {
+	hs := &InitialHandshake{}
+	// skip min version
+	hs.ServerVersion = string(data[1 : 1+bytes.IndexByte(data[1:], 0)])
+	pos := 1 + len(hs.ServerVersion) + 1
+	hs.ConnID = uint64(binary.LittleEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+	copy(hs.Salt[:], data[pos:pos+8])
+	// skip filter
+	pos += 8 + 1
 	// capability lower 2 bytes
 	capability := uint32(binary.LittleEndian.Uint16(data[pos : pos+2]))
 	pos += 2
@@ -46,13 +158,15 @@ func ParseInitialHandshake(data []byte) (Capability, uint64, string) {
 		pos += 1 + 2
 		// capability flags (upper 2 bytes)
 		capability = uint32(binary.LittleEndian.Uint16(data[pos:pos+2]))<<16 | capability
-
 		// skip auth data len or [00]
 		// skip reserved (all [00])
-		// skip salt second part
-		// skip auth plugin
+		pos += 2 + 1 + 10
+		copy(hs.Salt[8:], data[pos:])
+		pos += 13
+		hs.AuthPlugin = string(data[pos : pos+bytes.IndexByte(data[pos:], 0)])
 	}
-	return Capability(capability), uint64(connid), serverVersion
+	hs.Capability = Capability(capability)
+	return hs
 }
 
 // HandshakeResp indicates the response read from the client.
@@ -460,4 +574,85 @@ func ParseQueryPacket(data []byte) string {
 		data = data[:len(data)-1]
 	}
 	return hack.String(data)
+}
+
+func MakeQueryPacket(stmt string) []byte {
+	request := make([]byte, len(stmt)+1)
+	request[0] = ComQuery.Byte()
+	copy(request[1:], hack.Slice(stmt))
+	return request
+}
+
+func MakePrepareStmtPacket(stmt string) []byte {
+	request := make([]byte, len(stmt)+1)
+	request[0] = ComStmtPrepare.Byte()
+	copy(request[1:], hack.Slice(stmt))
+	return request
+}
+
+func MakeExecuteStmtPacket(stmtID uint32, args []any) ([]byte, error) {
+	paramNum := len(args)
+	paramTypes := make([]byte, paramNum*2)
+	paramValues := make([][]byte, paramNum)
+	nullBitmap := make([]byte, (paramNum+7)>>3)
+	dataLen := 1 + 4 + 1 + 4 + len(nullBitmap) + 1 + len(paramTypes)
+	var newParamBoundFlag byte = 0
+
+	for i := range args {
+		if args[i] == nil {
+			nullBitmap[i/8] |= 1 << (uint(i) % 8)
+			paramTypes[i<<1] = fieldTypeNULL
+			continue
+		}
+
+		newParamBoundFlag = 1
+		switch v := args[i].(type) {
+		case int64:
+			paramTypes[i<<1] = fieldTypeLongLong
+			paramValues[i] = Uint64ToBytes(uint64(v))
+		case uint64:
+			paramTypes[i<<1] = fieldTypeLongLong
+			paramTypes[(i<<1)+1] = 0x80
+			paramValues[i] = Uint64ToBytes(v)
+		case float64:
+			paramTypes[i<<1] = fieldTypeDouble
+			paramValues[i] = Uint64ToBytes(math.Float64bits(v))
+		case string:
+			paramTypes[i<<1] = fieldTypeString
+			paramValues[i] = DumpLengthEncodedString(nil, hack.Slice(v))
+		default:
+			// we don't need other types currently
+			return nil, errors.WithStack(errors.Errorf("unsupported type %T", v))
+		}
+
+		dataLen += len(paramValues[i])
+	}
+
+	request := make([]byte, dataLen)
+	pos := 0
+	request[pos] = ComStmtExecute.Byte()
+	pos += 1
+	binary.LittleEndian.PutUint32(request[pos:], uint32(stmtID))
+	pos += 4
+	// cursor flag
+	pos += 1
+	// iteration count
+	request[pos] = 1
+	pos += 4
+
+	if paramNum > 0 {
+		copy(request[pos:], nullBitmap)
+		pos += len(nullBitmap)
+		request[pos] = newParamBoundFlag
+		pos++
+		if newParamBoundFlag == 1 {
+			copy(request[pos:], paramTypes)
+			pos += len(paramTypes)
+		}
+		for _, v := range paramValues {
+			copy(request[pos:], v)
+			pos += len(v)
+		}
+	}
+	return request, nil
 }

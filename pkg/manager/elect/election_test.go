@@ -14,7 +14,7 @@ import (
 )
 
 func TestElectOwner(t *testing.T) {
-	ts := newEtcdTestSuite(t, electionConfigForTest(1), "key")
+	ts := newEtcdTestSuite(t, "key")
 	t.Cleanup(ts.close)
 
 	// 2 nodes start and 1 node is the owner
@@ -23,6 +23,8 @@ func TestElectOwner(t *testing.T) {
 		elec2 := ts.newElection("2")
 		elec1.Start(context.Background())
 		elec2.Start(context.Background())
+		require.Equal(t, "1", elec1.ID())
+		require.Equal(t, "2", elec2.ID())
 		ownerID := ts.getOwnerID()
 		ts.expectEvent(ownerID, eventTypeElected)
 	}
@@ -64,7 +66,7 @@ func TestElectOwner(t *testing.T) {
 }
 
 func TestEtcdServerDown(t *testing.T) {
-	ts := newEtcdTestSuite(t, electionConfigForTest(1), "key")
+	ts := newEtcdTestSuite(t, "key")
 	t.Cleanup(ts.close)
 
 	elec1 := ts.newElection("1")
@@ -78,8 +80,8 @@ func TestEtcdServerDown(t *testing.T) {
 	// the owner should not retire before the server is up again
 	ts.expectNoEvent("1")
 	ts.startServer(addr)
-	// the previous owner only retires when the new one is elected
-	ts.expectEvent("1", eventTypeRetired, eventTypeElected)
+	// the owner should not retire because there's no other member
+	ts.expectNoEvent("1")
 	ownerID := ts.getOwnerID()
 	require.Equal(t, "1", ownerID)
 
@@ -89,16 +91,22 @@ func TestEtcdServerDown(t *testing.T) {
 	require.Error(t, err)
 	elec2 := ts.newElection("2")
 	elec2.Start(context.Background())
+	// the owner should not retire before the server is up again
+	ts.expectNoEvent("1")
 
 	// start the server again and the elections recover
 	ts.startServer(addr)
 	ownerID = ts.getOwnerID()
-	ts.expectEvent("1", eventTypeRetired)
-	ts.expectEvent(ownerID, eventTypeElected)
+	if ownerID == "1" {
+		ts.expectNoEvent("1")
+	} else {
+		ts.expectEvent("1", eventTypeRetired)
+		ts.expectEvent(ownerID, eventTypeElected)
+	}
 }
 
 func TestOwnerHang(t *testing.T) {
-	ts := newEtcdTestSuite(t, electionConfigForTest(1), "key")
+	ts := newEtcdTestSuite(t, "key")
 	t.Cleanup(ts.close)
 
 	// make the owner hang at loop
@@ -150,4 +158,7 @@ func TestOwnerMetric(t *testing.T) {
 	checkMetric("key", false)
 	checkMetric("key2/1", true)
 	checkMetric("key3/1", true)
+
+	elec3.Close()
+	checkMetric("key3/1", false)
 }

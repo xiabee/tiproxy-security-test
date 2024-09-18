@@ -31,10 +31,11 @@ func TestCreateConn(t *testing.T) {
 	cfg := &config.Config{}
 	certManager := cert.NewCertManager()
 	require.NoError(t, certManager.Init(cfg, lg, nil))
-	server, err := NewSQLServer(lg, cfg, certManager, &mockHsHandler{})
+	server, err := NewSQLServer(lg, cfg, certManager, nil, &mockHsHandler{})
 	require.NoError(t, err)
 	server.Run(context.Background(), nil)
 	defer func() {
+		server.PreClose()
 		require.NoError(t, server.Close())
 	}()
 
@@ -78,12 +79,12 @@ func TestGracefulCloseConn(t *testing.T) {
 			},
 		},
 	}
-	server, err := NewSQLServer(lg, cfg, nil, hsHandler)
+	server, err := NewSQLServer(lg, cfg, nil, nil, hsHandler)
 	require.NoError(t, err)
 	finish := make(chan struct{})
 	go func() {
-		err = server.Close()
-		require.NoError(t, err)
+		server.PreClose()
+		require.NoError(t, server.Close())
 		finish <- struct{}{}
 	}()
 	select {
@@ -101,19 +102,20 @@ func TestGracefulCloseConn(t *testing.T) {
 		}()
 		conn, err := server.listeners[0].Accept()
 		require.NoError(t, err)
-		clientConn := client.NewClientConnection(lg, conn, nil, nil, hsHandler, 0, "", &backend.BCConfig{})
+		clientConn := client.NewClientConnection(lg, conn, nil, nil, hsHandler, nil, 0, "", &backend.BCConfig{})
 		server.mu.clients[1] = clientConn
 		server.mu.Unlock()
 		return clientConn
 	}
 
 	// Graceful shutdown will be blocked if there are alive connections.
-	server, err = NewSQLServer(lg, cfg, nil, hsHandler)
+	server, err = NewSQLServer(lg, cfg, nil, nil, hsHandler)
 	require.NoError(t, err)
 	clientConn := createClientConn()
 	go func() {
-		require.NoError(t, server.Close())
+		server.PreClose()
 		finish <- struct{}{}
+		require.NoError(t, server.Close())
 	}()
 	select {
 	case <-time.After(300 * time.Millisecond):
@@ -133,10 +135,11 @@ func TestGracefulCloseConn(t *testing.T) {
 
 	// Graceful shutdown will shut down after GracefulCloseConnTimeout.
 	cfg.Proxy.GracefulCloseConnTimeout = 1
-	server, err = NewSQLServer(lg, cfg, nil, hsHandler)
+	server, err = NewSQLServer(lg, cfg, nil, nil, hsHandler)
 	require.NoError(t, err)
 	createClientConn()
 	go func() {
+		server.PreClose()
 		require.NoError(t, server.Close())
 		finish <- struct{}{}
 	}()
@@ -160,19 +163,20 @@ func TestGracefulShutDown(t *testing.T) {
 			},
 		},
 	}
-	server, err := NewSQLServer(lg, cfg, certManager, &mockHsHandler{})
+	server, err := NewSQLServer(lg, cfg, certManager, nil, &mockHsHandler{})
 	require.NoError(t, err)
 	server.Run(context.Background(), nil)
 
 	var wg waitgroup.WaitGroup
 	wg.Run(func() {
-		// Wait until the server begins to shut down.
-		require.Eventually(t, server.IsClosing, 500*time.Millisecond, 10*time.Millisecond)
 		// The listener should be open and handshake should proceed.
 		_, port, err := net.SplitHostPort(server.listeners[0].Addr().String())
 		require.NoError(t, err)
 		mdb, err := sql.Open("mysql", fmt.Sprintf("root@tcp(localhost:%s)/test", port))
 		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			return mdb.Ping() != nil
+		}, 3*time.Second, 10*time.Millisecond)
 		require.ErrorContains(t, mdb.Ping(), "no router")
 		// The listener should be closed after GracefulWaitBeforeShutdown.
 		require.Eventually(t, func() bool {
@@ -183,6 +187,7 @@ func TestGracefulShutDown(t *testing.T) {
 			return err != nil
 		}, 3*time.Second, 100*time.Millisecond)
 	})
+	server.PreClose()
 	require.NoError(t, server.Close())
 	wg.Wait()
 }
@@ -196,7 +201,7 @@ func TestMultiAddr(t *testing.T) {
 		Proxy: config.ProxyServer{
 			Addr: "0.0.0.0:0,0.0.0.0:0",
 		},
-	}, certManager, &mockHsHandler{})
+	}, certManager, nil, &mockHsHandler{})
 	require.NoError(t, err)
 	server.Run(context.Background(), nil)
 
@@ -207,6 +212,7 @@ func TestMultiAddr(t *testing.T) {
 		require.NoError(t, conn.Close())
 	}
 
+	server.PreClose()
 	require.NoError(t, server.Close())
 	certManager.Close()
 }
@@ -215,7 +221,7 @@ func TestWatchCfg(t *testing.T) {
 	lg, _ := logger.CreateLoggerForTest(t)
 	hsHandler := backend.NewDefaultHandshakeHandler(nil)
 	cfgch := make(chan *config.Config)
-	server, err := NewSQLServer(lg, &config.Config{}, nil, hsHandler)
+	server, err := NewSQLServer(lg, &config.Config{}, nil, nil, hsHandler)
 	require.NoError(t, err)
 	server.Run(context.Background(), cfgch)
 	cfg := &config.Config{
@@ -241,6 +247,7 @@ func TestWatchCfg(t *testing.T) {
 			server.mu.proxyProtocol == (cfg.Proxy.ProxyProtocol != "") &&
 			server.mu.gracefulWait == cfg.Proxy.GracefulWaitBeforeShutdown
 	}, 3*time.Second, 10*time.Millisecond)
+	server.PreClose()
 	require.NoError(t, server.Close())
 }
 
@@ -249,9 +256,9 @@ func TestRecoverPanic(t *testing.T) {
 	certManager := cert.NewCertManager()
 	err := certManager.Init(&config.Config{}, lg, nil)
 	require.NoError(t, err)
-	server, err := NewSQLServer(lg, &config.Config{}, certManager, &mockHsHandler{
+	server, err := NewSQLServer(lg, &config.Config{}, certManager, nil, &mockHsHandler{
 		handshakeResp: func(ctx backend.ConnContext, _ *pnet.HandshakeResp) error {
-			if ctx.Value(backend.ConnContextKeyConnID).(uint64) == 0 {
+			if ctx.Value(backend.ConnContextKeyConnID).(uint64) == 1 {
 				panic("HandleHandshakeResp panic")
 			}
 			return nil
@@ -272,6 +279,7 @@ func TestRecoverPanic(t *testing.T) {
 	// The second connection gets a server error, which means the server is still running.
 	require.ErrorContains(t, mdb.Ping(), "no router")
 	require.NoError(t, mdb.Close())
+	server.PreClose()
 	require.NoError(t, server.Close())
 	certManager.Close()
 }

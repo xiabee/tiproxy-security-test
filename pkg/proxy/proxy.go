@@ -19,18 +19,8 @@ import (
 	"github.com/pingcap/tiproxy/pkg/proxy/client"
 	"github.com/pingcap/tiproxy/pkg/proxy/keepalive"
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
+	"github.com/pingcap/tiproxy/pkg/sqlreplay/capture"
 	"go.uber.org/zap"
-)
-
-type serverStatus int
-
-const (
-	// statusNormal: normal status
-	statusNormal serverStatus = iota
-	// statusWaitShutdown: during graceful-wait-before-shutdown
-	statusWaitShutdown
-	// statusDrainClient: during graceful-close-conn-timeout
-	statusDrainClient
 )
 
 type serverState struct {
@@ -46,7 +36,6 @@ type serverState struct {
 	proxyProtocol      bool
 	gracefulWait       int // graceful-wait-before-shutdown
 	gracefulClose      int // graceful-close-conn-timeout
-	status             serverStatus
 }
 
 type SQLServer struct {
@@ -55,6 +44,7 @@ type SQLServer struct {
 	logger     *zap.Logger
 	certMgr    *cert.CertManager
 	hsHandler  backend.HandshakeHandler
+	cpt        capture.Capture
 	wg         waitgroup.WaitGroup
 	cancelFunc context.CancelFunc
 
@@ -62,16 +52,16 @@ type SQLServer struct {
 }
 
 // NewSQLServer creates a new SQLServer.
-func NewSQLServer(logger *zap.Logger, cfg *config.Config, certMgr *cert.CertManager, hsHandler backend.HandshakeHandler) (*SQLServer, error) {
+func NewSQLServer(logger *zap.Logger, cfg *config.Config, certMgr *cert.CertManager, cpt capture.Capture, hsHandler backend.HandshakeHandler) (*SQLServer, error) {
 	var err error
 	s := &SQLServer{
 		logger:    logger,
 		certMgr:   certMgr,
 		hsHandler: hsHandler,
+		cpt:       cpt,
 		mu: serverState{
 			connID:  0,
 			clients: make(map[uint64]*client.ClientConnection),
-			status:  statusNormal,
 		},
 	}
 
@@ -160,12 +150,12 @@ func (s *SQLServer) onConn(ctx context.Context, conn net.Conn, addr string) {
 			return false, nil, 0, nil
 		}
 
-		connID := s.mu.connID
 		s.mu.connID++
+		connID := s.mu.connID
 		logger := s.logger.With(zap.Uint64("connID", connID), zap.String("client_addr", conn.RemoteAddr().String()),
 			zap.String("addr", addr))
 		clientConn := client.NewClientConnection(logger.Named("conn"), conn, s.certMgr.ServerSQLTLS(), s.certMgr.SQLTLS(),
-			s.hsHandler, connID, addr, &backend.BCConfig{
+			s.hsHandler, s.cpt, connID, addr, &backend.BCConfig{
 				ProxyProtocol:      s.mu.proxyProtocol,
 				RequireBackendTLS:  s.mu.requireBackendTLS,
 				HealthyKeepAlive:   s.mu.healthyKeepAlive,
@@ -204,32 +194,25 @@ func (s *SQLServer) onConn(ctx context.Context, conn net.Conn, addr string) {
 	clientConn.Run(ctx)
 }
 
-// IsClosing tells the HTTP API whether it should return healthy status.
-func (s *SQLServer) IsClosing() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.mu.status >= statusWaitShutdown
-}
-
-func (s *SQLServer) gracefulShutdown() {
+func (s *SQLServer) PreClose() {
 	// Step 1: HTTP status returns unhealthy so that NLB takes this instance offline and then new connections won't come.
 	s.mu.Lock()
 	gracefulWait := s.mu.gracefulWait
-	s.mu.status = statusWaitShutdown
 	s.mu.Unlock()
 	s.logger.Info("SQL server prepares for shutdown", zap.Int("graceful_wait", gracefulWait))
 	if gracefulWait > 0 {
 		time.Sleep(time.Duration(gracefulWait) * time.Second)
 	}
 
-	// Step 2: reject new connections and drain clients.
+	// Step 2: reject new connections
 	for i := range s.listeners {
 		if err := s.listeners[i].Close(); err != nil {
 			s.logger.Warn("closing listener fails", zap.Error(err))
 		}
 	}
+
+	// Step 3: gracefully waiting for connections to finish the current transactions
 	s.mu.Lock()
-	s.mu.status = statusDrainClient
 	gracefulClose := s.mu.gracefulClose
 	s.logger.Info("SQL server is shutting down", zap.Int("graceful_close", gracefulClose), zap.Int("conn_count", len(s.mu.clients)))
 	if gracefulClose <= 0 {
@@ -260,8 +243,6 @@ func (s *SQLServer) gracefulShutdown() {
 
 // Close closes the server.
 func (s *SQLServer) Close() error {
-	s.gracefulShutdown()
-
 	if s.cancelFunc != nil {
 		s.cancelFunc()
 		s.cancelFunc = nil

@@ -25,7 +25,7 @@ const (
 
 type VIPManager interface {
 	Start(context.Context, *clientv3.Client) error
-	Resign()
+	PreClose()
 	Close()
 }
 
@@ -35,8 +35,8 @@ type vipManager struct {
 	operation   NetworkOperation
 	cfgGetter   config.ConfigGetter
 	election    elect.Election
-	delOnRetire atomic.Bool
 	lg          *zap.Logger
+	delOnRetire atomic.Bool
 }
 
 func NewVIPManager(lg *zap.Logger, cfgGetter config.ConfigGetter) (*vipManager, error) {
@@ -58,11 +58,14 @@ func NewVIPManager(lg *zap.Logger, cfgGetter config.ConfigGetter) (*vipManager, 
 		return nil, err
 	}
 	vm.operation = operation
-	vm.delOnRetire.Store(true)
 	return vm, nil
 }
 
 func (vm *vipManager) Start(ctx context.Context, etcdCli *clientv3.Client) error {
+	// This node may have bound the VIP before last failure.
+	vm.delVIP()
+	vm.delOnRetire.Store(true)
+
 	cfg := vm.cfgGetter.GetConfig()
 	ip, port, _, err := cfg.GetIPPort()
 	if err != nil {
@@ -124,19 +127,20 @@ func (vm *vipManager) delVIP() {
 	vm.lg.Info("deleting VIP success")
 }
 
-// Resign stops compaign but does not delete the VIP.
-// It's called before graceful wait to avoid that the VIP is deleted before another member adds VIP.
-func (vm *vipManager) Resign() {
+// PreClose resigns the owner but doesn't delete the VIP.
+// It makes use of the graceful-wait time to wait for the new owner to shorten the failover time.
+func (vm *vipManager) PreClose() {
 	vm.delOnRetire.Store(false)
 	if vm.election != nil {
 		vm.election.Close()
-		vm.election = nil
 	}
 }
 
-// Close stops compaign and deletes the VIP.
-// It's called after graceful wait to ensure the VIP is finally deleted.
+// Close resigns the owner and deletes the VIP if it was the owner.
+// The new owner may not be elected but we won't wait anymore.
 func (vm *vipManager) Close() {
-	vm.Resign()
+	if vm.election != nil {
+		vm.election.Close()
+	}
 	vm.delVIP()
 }
