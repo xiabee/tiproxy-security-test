@@ -14,6 +14,7 @@ import (
 	"github.com/pingcap/tiproxy/pkg/balance/metricsreader"
 	"github.com/pingcap/tiproxy/pkg/manager/cert"
 	mgrcfg "github.com/pingcap/tiproxy/pkg/manager/config"
+	"github.com/pingcap/tiproxy/pkg/manager/id"
 	"github.com/pingcap/tiproxy/pkg/manager/infosync"
 	"github.com/pingcap/tiproxy/pkg/manager/logger"
 	mgrns "github.com/pingcap/tiproxy/pkg/manager/namespace"
@@ -36,7 +37,7 @@ type Server struct {
 	wg waitgroup.WaitGroup
 	// managers
 	configManager    *mgrcfg.ConfigManager
-	namespaceManager *mgrns.NamespaceManager
+	namespaceManager mgrns.NamespaceManager
 	metricsManager   *metrics.MetricsManager
 	loggerManager    *logger.LoggerManager
 	certManager      *cert.CertManager
@@ -67,13 +68,13 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 
 	// set up logger
 	var lg *zap.Logger
-	if srv.loggerManager, lg, err = logger.NewLoggerManager(&sctx.Overlay.Log); err != nil {
+	if srv.loggerManager, lg, err = logger.NewLoggerManager(nil); err != nil {
 		return
 	}
 	srv.loggerManager.Init(srv.configManager.WatchConfig())
 
 	// setup config manager
-	if err = srv.configManager.Init(ctx, lg.Named("config"), sctx.ConfigFile, &sctx.Overlay); err != nil {
+	if err = srv.configManager.Init(ctx, lg.Named("config"), sctx.ConfigFile, sctx.AdvertiseAddr); err != nil {
 		return
 	}
 	cfg := srv.configManager.GetConfig()
@@ -161,16 +162,16 @@ func NewServer(ctx context.Context, sctx *sctx.Context) (srv *Server, err error)
 	} else {
 		hsHandler = backend.NewDefaultHandshakeHandler(srv.namespaceManager)
 	}
+	idMgr := id.NewIDManager()
 
 	// setup capture and replay job manager
 	{
-		srv.replay = mgrrp.NewJobManager(lg.Named("replay"), srv.configManager.GetConfig(), srv.certManager, hsHandler)
+		srv.replay = mgrrp.NewJobManager(lg.Named("replay"), srv.configManager.GetConfig(), srv.certManager, idMgr, hsHandler)
 	}
 
 	// setup proxy server
 	{
-
-		srv.proxy, err = proxy.NewSQLServer(lg.Named("proxy"), cfg, srv.certManager, srv.replay.GetCapture(), hsHandler)
+		srv.proxy, err = proxy.NewSQLServer(lg.Named("proxy"), cfg, srv.certManager, idMgr, srv.replay.GetCapture(), hsHandler)
 		if err != nil {
 			return
 		}

@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -33,8 +34,10 @@ type LineReader interface {
 }
 
 type Command struct {
+	PreparedStmt string
+	Params       []any
+	digest       string
 	// Payload starts with command type so that replay can reuse this byte array.
-	digest   string
 	Payload  []byte
 	StartTs  time.Time
 	ConnID   uint64
@@ -89,7 +92,7 @@ func (c *Command) Encode(writer *bytes.Buffer) error {
 		return err
 	}
 	if c.Type != pnet.ComQuery {
-		if err = writeByte(keyType, c.Type.Byte(), writer); err != nil {
+		if err = writeString(keyType, c.Type.String(), writer); err != nil {
 			return err
 		}
 	}
@@ -156,7 +159,7 @@ func (c *Command) Decode(reader LineReader) error {
 			if c.Type != pnet.ComQuery {
 				return errors.Errorf("%s, line %d: redundant Cmd_type: %s, Cmd_type was %v", filename, lineIdx, line, c.Type)
 			}
-			c.Type = pnet.Command(value[0])
+			c.Type = pnet.CommandFromString(value)
 		case keySuccess:
 			c.Succeess = value == "true"
 		case keyPayloadLen:
@@ -191,12 +194,14 @@ func (c *Command) Decode(reader LineReader) error {
 }
 
 func (c *Command) Digest() string {
-	if c.digest == "" {
-		// TODO: ComStmtExecute
+	if len(c.digest) == 0 {
 		switch c.Type {
 		case pnet.ComQuery, pnet.ComStmtPrepare:
 			stmt := hack.String(c.Payload[1:])
 			_, digest := parser.NormalizeDigest(stmt)
+			c.digest = digest.String()
+		case pnet.ComStmtExecute:
+			_, digest := parser.NormalizeDigest(c.PreparedStmt)
 			c.digest = digest.String()
 		}
 	}
@@ -204,10 +209,11 @@ func (c *Command) Digest() string {
 }
 
 func (c *Command) QueryText() string {
-	// TODO: ComStmtExecute
 	switch c.Type {
 	case pnet.ComQuery, pnet.ComStmtPrepare:
 		return hack.String(c.Payload[1:])
+	case pnet.ComStmtExecute:
+		return fmt.Sprintf("%s params=%v", c.PreparedStmt, c.Params)
 	}
 	return ""
 }
@@ -218,20 +224,6 @@ func writeString(key, value string, writer *bytes.Buffer) error {
 		return errors.WithStack(err)
 	}
 	if _, err = writer.WriteString(value); err != nil {
-		return errors.WithStack(err)
-	}
-	if err = writer.WriteByte('\n'); err != nil {
-		return errors.WithStack(err)
-	}
-	return nil
-}
-
-func writeByte(key string, value byte, writer *bytes.Buffer) error {
-	var err error
-	if _, err = writer.WriteString(key); err != nil {
-		return errors.WithStack(err)
-	}
-	if err = writer.WriteByte(value); err != nil {
 		return errors.WithStack(err)
 	}
 	if err = writer.WriteByte('\n'); err != nil {

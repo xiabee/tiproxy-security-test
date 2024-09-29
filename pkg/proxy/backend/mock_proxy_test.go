@@ -140,11 +140,13 @@ func (mc *mockCapture) Capture(packet []byte, startTime time.Time, connID uint64
 	mc.packet = packet
 	mc.startTime = startTime
 	mc.connID = connID
-	mc.initSql, _ = initSession()
+	if initSession != nil {
+		mc.initSql, _ = initSession()
+	}
 }
 
-func (mc *mockCapture) Progress() (float64, error) {
-	return 0, nil
+func (mc *mockCapture) Progress() (float64, time.Time, error) {
+	return 0, time.Time{}, nil
 }
 
 func (mc *mockCapture) Close() {

@@ -6,8 +6,10 @@ package conn
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/manager/id"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/cmd"
@@ -33,18 +35,20 @@ type conn struct {
 	closeCh     chan<- uint64
 	lg          *zap.Logger
 	backendConn BackendConn
-	connID      uint64 // frontend connection id
+	connID      uint64 // capture ID, not replay ID
 }
 
-func NewConn(lg *zap.Logger, username, password string, backendTLSConfig *tls.Config, hsHandler backend.HandshakeHandler, connID uint64,
-	bcConfig *backend.BCConfig, exceptionCh chan<- Exception, closeCh chan<- uint64) *conn {
+func NewConn(lg *zap.Logger, username, password string, backendTLSConfig *tls.Config, hsHandler backend.HandshakeHandler,
+	idMgr *id.IDManager, connID uint64, bcConfig *backend.BCConfig, exceptionCh chan<- Exception, closeCh chan<- uint64) *conn {
+	backendConnID := idMgr.NewID()
+	lg = lg.With(zap.Uint64("captureID", connID), zap.Uint64("replayID", backendConnID))
 	return &conn{
-		lg:          lg.With(zap.Uint64("connID", connID)),
+		lg:          lg,
 		connID:      connID,
 		cmdCh:       make(chan *cmd.Command, maxPendingCommands),
 		exceptionCh: exceptionCh,
 		closeCh:     closeCh,
-		backendConn: NewBackendConn(lg.Named("be"), connID, hsHandler, bcConfig, backendTLSConfig, username, password),
+		backendConn: NewBackendConn(lg.Named("be"), backendConnID, hsHandler, bcConfig, backendTLSConfig, username, password),
 	}
 }
 
@@ -60,13 +64,33 @@ func (c *conn) Run(ctx context.Context) {
 			return
 		case command := <-c.cmdCh:
 			if err := c.backendConn.ExecuteCmd(ctx, command.Payload); err != nil {
-				c.exceptionCh <- NewFailException(err, command)
+				if c.updateCmdForExecuteStmt(command) {
+					c.exceptionCh <- NewFailException(err, command)
+				}
 				if pnet.IsDisconnectError(err) {
 					return
 				}
 			}
 		}
 	}
+}
+
+func (c *conn) updateCmdForExecuteStmt(command *cmd.Command) bool {
+	if command.Type == pnet.ComStmtExecute && len(command.Payload) >= 5 {
+		stmtID := binary.LittleEndian.Uint32(command.Payload[1:5])
+		text, paramNum := c.backendConn.GetPreparedStmt(stmtID)
+		if len(text) == 0 {
+			c.lg.Error("prepared stmt not found", zap.Uint32("stmt_id", stmtID))
+			return false
+		}
+		_, args, err := pnet.ParseExecuteStmtRequest(command.Payload, paramNum)
+		if err != nil {
+			c.lg.Error("parse execute stmt request failed", zap.Uint32("stmt_id", stmtID), zap.Error(err))
+		}
+		command.PreparedStmt = text
+		command.Params = args
+	}
+	return true
 }
 
 // ExecuteCmd executes a command asynchronously.

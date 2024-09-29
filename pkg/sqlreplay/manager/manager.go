@@ -10,11 +10,16 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/config"
 	"github.com/pingcap/tiproxy/lib/util/errors"
+	"github.com/pingcap/tiproxy/pkg/manager/id"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/capture"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/replay"
 	"github.com/siddontang/go/hack"
 	"go.uber.org/zap"
+)
+
+const (
+	maxJobHistoryCount = 10
 )
 
 type CertManager interface {
@@ -42,11 +47,11 @@ type jobManager struct {
 	lg          *zap.Logger
 }
 
-func NewJobManager(lg *zap.Logger, cfg *config.Config, certMgr CertManager, hsHandler backend.HandshakeHandler) *jobManager {
+func NewJobManager(lg *zap.Logger, cfg *config.Config, certMgr CertManager, idMgr *id.IDManager, hsHandler backend.HandshakeHandler) *jobManager {
 	return &jobManager{
 		lg:          lg,
 		capture:     capture.NewCapture(lg.Named("capture")),
-		replay:      replay.NewReplay(lg.Named("replay")),
+		replay:      replay.NewReplay(lg.Named("replay"), idMgr),
 		hsHandler:   hsHandler,
 		cfg:         cfg,
 		certManager: certMgr,
@@ -61,11 +66,11 @@ func (jm *jobManager) updateProgress() {
 	if job.IsRunning() {
 		switch job.Type() {
 		case Capture:
-			progress, err := jm.capture.Progress()
-			job.SetProgress(progress, err)
+			progress, endTime, err := jm.capture.Progress()
+			job.SetProgress(progress, endTime, err)
 		case Replay:
-			progress, err := jm.replay.Progress()
-			job.SetProgress(progress, err)
+			progress, endTime, err := jm.replay.Progress()
+			job.SetProgress(progress, endTime, err)
 		}
 	}
 }
@@ -93,12 +98,12 @@ func (jm *jobManager) StartCapture(cfg capture.CaptureConfig) error {
 	}
 	newJob := &captureJob{
 		job: job{
-			StartTime: time.Now(),
-			Duration:  cfg.Duration,
+			startTime: time.Now(),
 		},
+		cfg: cfg,
 	}
 	jm.lg.Info("start capture", zap.String("job", newJob.String()))
-	jm.jobHistory = append(jm.jobHistory, newJob)
+	jm.addToHistory(newJob)
 	return nil
 }
 
@@ -121,12 +126,22 @@ func (jm *jobManager) StartReplay(cfg replay.ReplayConfig) error {
 	}
 	newJob := &replayJob{
 		job: job{
-			StartTime: time.Now(),
+			startTime: time.Now(),
 		},
+		cfg: cfg,
 	}
 	jm.lg.Info("start replay", zap.String("job", newJob.String()))
-	jm.jobHistory = append(jm.jobHistory, newJob)
+	jm.addToHistory(newJob)
 	return nil
+}
+
+func (jm *jobManager) addToHistory(newJob Job) {
+	if len(jm.jobHistory) >= maxJobHistoryCount {
+		copy(jm.jobHistory, jm.jobHistory[1:])
+		jm.jobHistory[len(jm.jobHistory)-1] = newJob
+	} else {
+		jm.jobHistory = append(jm.jobHistory, newJob)
+	}
 }
 
 func (jm *jobManager) GetCapture() capture.Capture {
@@ -135,7 +150,7 @@ func (jm *jobManager) GetCapture() capture.Capture {
 
 func (jm *jobManager) Jobs() string {
 	jm.updateProgress()
-	b, err := json.Marshal(jm.jobHistory)
+	b, err := json.MarshalIndent(jm.jobHistory, "", "  ")
 	if err != nil {
 		return err.Error()
 	}

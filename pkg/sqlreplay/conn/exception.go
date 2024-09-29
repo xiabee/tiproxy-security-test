@@ -5,6 +5,7 @@ package conn
 
 import (
 	"errors"
+	"time"
 
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/cmd"
@@ -70,6 +71,7 @@ func (oe *OtherException) Error() string {
 type FailException struct {
 	key     string
 	err     error
+	ts      time.Time
 	command *cmd.Command
 }
 
@@ -77,10 +79,11 @@ func NewFailException(err error, command *cmd.Command) *FailException {
 	fail := &FailException{
 		err:     err,
 		command: command,
+		ts:      time.Now(),
 	}
 	var b []byte
 	switch command.Type {
-	case pnet.ComQuery, pnet.ComStmtPrepare:
+	case pnet.ComQuery, pnet.ComStmtPrepare, pnet.ComStmtExecute:
 		digest := command.Digest()
 		b = make([]byte, 1+len(digest))
 		b[0] = command.Type.Byte()
@@ -102,6 +105,10 @@ func (fe *FailException) Key() string {
 
 func (fe *FailException) ConnID() uint64 {
 	return fe.command.ConnID
+}
+
+func (fe *FailException) Time() time.Time {
+	return fe.ts
 }
 
 func (fe *FailException) Command() *cmd.Command {

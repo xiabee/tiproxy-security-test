@@ -44,7 +44,7 @@ type Capture interface {
 	// Capture captures traffic
 	Capture(packet []byte, startTime time.Time, connID uint64, initSession func() (string, error))
 	// Progress returns the progress of the capture job
-	Progress() (float64, error)
+	Progress() (float64, time.Time, error)
 	// Close closes the capture
 	Close()
 }
@@ -270,6 +270,10 @@ func (c *capture) Capture(packet []byte, startTime time.Time, connID uint64, ini
 
 	// If this is the first command for this connection, record a `set session_states` statement.
 	if !inited {
+		// Maybe it's quitting, no need to init session.
+		if initSession == nil || len(packet) == 0 || packet[0] == pnet.ComQuit.Byte() {
+			return
+		}
 		// initSession is slow, do not call it in the lock.
 		sql, err := initSession()
 		if err != nil {
@@ -291,11 +295,6 @@ func (c *capture) Capture(packet []byte, startTime time.Time, connID uint64, ini
 	if command == nil {
 		return
 	}
-	// COM_CHANGE_USER sends auth data, so ignore it.
-	if command.Type == pnet.ComChangeUser {
-		return
-	}
-	// TODO: handle QUIT and delete c.conns[connID]
 	c.Lock()
 	defer c.Unlock()
 	c.putCommand(command)
@@ -304,6 +303,25 @@ func (c *capture) Capture(packet []byte, startTime time.Time, connID uint64, ini
 func (c *capture) putCommand(command *cmd.Command) bool {
 	if c.status != statusRunning {
 		return false
+	}
+	switch command.Type {
+	case pnet.ComQuit:
+		if _, ok := c.conns[command.ConnID]; ok {
+			delete(c.conns, command.ConnID)
+		} else {
+			// Duplicated quit, ignore it.
+			return false
+		}
+	case pnet.ComChangeUser:
+		// COM_CHANGE_USER sends auth data, change it to COM_RESET_CONNECTION.
+		command.Type = pnet.ComResetConnection
+		command.Payload = []byte{pnet.ComResetConnection.Byte()}
+	case pnet.ComQuery:
+		// Avoid password leakage.
+		if IsSensitiveSQL(hack.String(command.Payload[1:])) {
+			c.filteredCmds++
+			return false
+		}
 	}
 	select {
 	case c.cmdCh <- command:
@@ -322,17 +340,17 @@ func (c *capture) writeMeta(duration time.Duration, cmds uint64) {
 	}
 }
 
-func (c *capture) Progress() (float64, error) {
+func (c *capture) Progress() (float64, time.Time, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.status == statusIdle || c.cfg.Duration == 0 {
-		return c.progress, c.err
+		return c.progress, c.endTime, c.err
 	}
 	progress := float64(time.Since(c.startTime)) / float64(c.cfg.Duration)
 	if progress > 1 {
 		progress = 1
 	}
-	return progress, c.err
+	return progress, c.endTime, c.err
 }
 
 // stopNoLock must be called after holding a lock.

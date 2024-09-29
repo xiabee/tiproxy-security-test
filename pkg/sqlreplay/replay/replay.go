@@ -14,8 +14,8 @@ import (
 
 	"github.com/pingcap/tiproxy/lib/util/errors"
 	"github.com/pingcap/tiproxy/lib/util/waitgroup"
+	"github.com/pingcap/tiproxy/pkg/manager/id"
 	"github.com/pingcap/tiproxy/pkg/proxy/backend"
-	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/cmd"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/conn"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/report"
@@ -35,7 +35,7 @@ type Replay interface {
 	// Stop stops the replay
 	Stop(err error)
 	// Progress returns the progress of the replay job
-	Progress() (float64, error)
+	Progress() (float64, time.Time, error)
 	// Close closes the replay
 	Close()
 }
@@ -79,6 +79,7 @@ type replay struct {
 	cfg              ReplayConfig
 	meta             store.Meta
 	conns            map[uint64]conn.Conn
+	idMgr            *id.IDManager
 	exceptionCh      chan conn.Exception
 	closeCh          chan uint64
 	wg               waitgroup.WaitGroup
@@ -96,9 +97,10 @@ type replay struct {
 	lg               *zap.Logger
 }
 
-func NewReplay(lg *zap.Logger) *replay {
+func NewReplay(lg *zap.Logger, idMgr *id.IDManager) *replay {
 	return &replay{
-		lg: lg,
+		lg:    lg,
+		idMgr: idMgr,
 	}
 }
 
@@ -121,14 +123,14 @@ func (r *replay) Start(cfg ReplayConfig, backendTLSConfig *tls.Config, hsHandler
 	r.connCreator = cfg.connCreator
 	if r.connCreator == nil {
 		r.connCreator = func(connID uint64) conn.Conn {
-			return conn.NewConn(r.lg.Named("conn"), r.cfg.Username, r.cfg.Password, backendTLSConfig, hsHandler, connID, bcConfig, r.exceptionCh, r.closeCh)
+			return conn.NewConn(r.lg.Named("conn"), r.cfg.Username, r.cfg.Password, backendTLSConfig, hsHandler, r.idMgr,
+				connID, bcConfig, r.exceptionCh, r.closeCh)
 		}
 	}
 	r.report = cfg.report
 	if r.report == nil {
 		backendConnCreator := func() conn.BackendConn {
-			// TODO: allocate connection ID.
-			return conn.NewBackendConn(r.lg.Named("be"), 1, hsHandler, bcConfig, backendTLSConfig, r.cfg.Username, r.cfg.Password)
+			return conn.NewBackendConn(r.lg.Named("be"), r.idMgr.NewID(), hsHandler, bcConfig, backendTLSConfig, r.cfg.Username, r.cfg.Password)
 		}
 		r.report = report.NewReport(r.lg.Named("report"), r.exceptionCh, backendConnCreator)
 	}
@@ -168,12 +170,6 @@ func (r *replay) readCommands(ctx context.Context) {
 			}
 			r.Stop(err)
 			break
-		}
-		// Replayer always uses the same username. It has no passwords for other users.
-		// TODO: clear the session states.
-		if command.Type == pnet.ComChangeUser {
-			r.filteredCmds++
-			continue
 		}
 		if captureStartTs.IsZero() {
 			// first command
@@ -250,13 +246,13 @@ func (r *replay) readCloseCh(ctx context.Context) {
 	}
 }
 
-func (r *replay) Progress() (float64, error) {
+func (r *replay) Progress() (float64, time.Time, error) {
 	r.Lock()
 	defer r.Unlock()
 	if r.meta.Cmds > 0 {
 		r.progress = float64(r.replayedCmds+r.filteredCmds) / float64(r.meta.Cmds)
 	}
-	return r.progress, r.err
+	return r.progress, r.endTime, r.err
 }
 
 func (r *replay) readMeta() *store.Meta {

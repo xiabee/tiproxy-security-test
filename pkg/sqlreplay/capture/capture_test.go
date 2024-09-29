@@ -170,12 +170,12 @@ func TestProgress(t *testing.T) {
 
 	now := time.Now()
 	require.NoError(t, cpt.Start(cfg))
-	progress, err := cpt.Progress()
+	progress, _, err := cpt.Progress()
 	require.NoError(t, err)
 	require.Less(t, progress, 0.3)
 
 	setStartTime(now.Add(-5 * time.Second))
-	progress, err = cpt.Progress()
+	progress, _, err = cpt.Progress()
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, progress, 0.5)
 
@@ -183,7 +183,7 @@ func TestProgress(t *testing.T) {
 	cpt.Capture(packet, time.Now(), 100, mockInitSession)
 	cpt.Stop(errors.Errorf("mock error"))
 	cpt.wg.Wait()
-	progress, err = cpt.Progress()
+	progress, _, err = cpt.Progress()
 	require.ErrorContains(t, err, "mock error")
 	require.GreaterOrEqual(t, progress, 0.5)
 	require.Less(t, progress, 1.0)
@@ -207,7 +207,6 @@ func TestInitConn(t *testing.T) {
 		cmdLogger: writer,
 	}
 
-	// start capture and the traffic should be outputted
 	require.NoError(t, cpt.Start(cfg))
 	cpt.InitConn(time.Now(), 100, "mockDB")
 	cpt.Capture(packet, time.Now(), 100, func() (string, error) {
@@ -227,4 +226,97 @@ func TestInitConn(t *testing.T) {
 	require.Equal(t, 1, strings.Count(data, "init session 101"))
 	require.Equal(t, 2, strings.Count(data, "select 1"))
 	require.Equal(t, uint64(4), cpt.capturedCmds)
+}
+
+func TestQuit(t *testing.T) {
+	cpt := NewCapture(zap.NewNop())
+	defer cpt.Close()
+
+	quitPacket := []byte{pnet.ComQuit.Byte()}
+	queryPacket := append([]byte{pnet.ComQuery.Byte()}, []byte("select 1")...)
+	writer := newMockWriter(store.WriterCfg{})
+	cfg := CaptureConfig{
+		Output:    t.TempDir(),
+		Duration:  10 * time.Second,
+		cmdLogger: writer,
+	}
+
+	require.NoError(t, cpt.Start(cfg))
+	// 100: quit
+	cpt.Capture(quitPacket, time.Now(), 100, func() (string, error) {
+		return "init session 100", nil
+	})
+	// 101: select + quit + quit
+	cpt.Capture(queryPacket, time.Now(), 101, func() (string, error) {
+		return "init session 101", nil
+	})
+	cpt.Capture(quitPacket, time.Now(), 101, func() (string, error) {
+		return "init session 101", nil
+	})
+	cpt.Capture(quitPacket, time.Now(), 101, func() (string, error) {
+		return "init session 101", nil
+	})
+	cpt.Stop(errors.Errorf("mock error"))
+
+	data := string(writer.getData())
+	require.Equal(t, 0, strings.Count(data, "init session 100"))
+	require.Equal(t, 1, strings.Count(data, "init session 101"))
+	require.Equal(t, 1, strings.Count(data, "select 1"))
+	require.Equal(t, 1, strings.Count(data, "# Cmd_type: Quit"))
+	require.Equal(t, uint64(3), cpt.capturedCmds)
+}
+
+func TestFilterCmds(t *testing.T) {
+	tests := []struct {
+		packet  []byte
+		want    string
+		notWant string
+	}{
+		{
+			packet: pnet.MakeChangeUser(&pnet.ChangeUserReq{
+				User: "root",
+				DB:   "test",
+			}, 0),
+			want:    pnet.ComResetConnection.String(),
+			notWant: pnet.ComChangeUser.String(),
+		},
+		{
+			packet:  append([]byte{pnet.ComQuery.Byte()}, []byte("CREATE USER u1 IDENTIFIED BY '123456'")...),
+			notWant: "123456",
+		},
+		{
+			packet: append([]byte{pnet.ComQuery.Byte()}, []byte("select 1")...),
+			want:   "select 1",
+		},
+	}
+
+	cfg := CaptureConfig{
+		Output:   t.TempDir(),
+		Duration: 10 * time.Second,
+	}
+	for i, test := range tests {
+		cpt := NewCapture(zap.NewNop())
+		writer := newMockWriter(store.WriterCfg{})
+		cfg.cmdLogger = writer
+		require.NoError(t, cpt.Start(cfg))
+		cpt.Capture(test.packet, time.Now(), 100, func() (string, error) {
+			return "init session 100", nil
+		})
+		cpt.Stop(nil)
+
+		data := string(writer.getData())
+		if len(test.want) > 0 {
+			require.Equal(t, 1, strings.Count(data, test.want), "case %d", i)
+			require.Equal(t, uint64(2), cpt.capturedCmds, "case %d", i)
+			require.Equal(t, uint64(0), cpt.filteredCmds, "case %d", i)
+		} else {
+			require.Equal(t, uint64(1), cpt.capturedCmds, "case %d", i)
+			require.Equal(t, uint64(1), cpt.filteredCmds, "case %d", i)
+		}
+		if len(test.notWant) > 0 {
+			require.Equal(t, 0, strings.Count(data, test.notWant), "case %d", i)
+		}
+
+		cpt.Close()
+	}
 }
