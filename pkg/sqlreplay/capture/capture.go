@@ -15,6 +15,7 @@ import (
 	pnet "github.com/pingcap/tiproxy/pkg/proxy/net"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/cmd"
 	"github.com/pingcap/tiproxy/pkg/sqlreplay/store"
+	"github.com/pingcap/tiproxy/pkg/util/lex"
 	"github.com/siddontang/go/hack"
 	"go.uber.org/zap"
 )
@@ -44,7 +45,7 @@ type Capture interface {
 	// Capture captures traffic
 	Capture(packet []byte, startTime time.Time, connID uint64, initSession func() (string, error))
 	// Progress returns the progress of the capture job
-	Progress() (float64, time.Time, error)
+	Progress() (float64, time.Time, bool, error)
 	// Close closes the capture
 	Close()
 }
@@ -235,9 +236,10 @@ func (c *capture) flushBuffer(bufCh <-chan *bytes.Buffer) {
 	c.Lock()
 	startTime := c.startTime
 	capturedCmds := c.capturedCmds
+	filteredCmds := c.filteredCmds
 	c.Unlock()
 	// Write meta outside of the lock to avoid affecting QPS.
-	c.writeMeta(time.Since(startTime), capturedCmds)
+	c.writeMeta(time.Since(startTime), capturedCmds, filteredCmds)
 }
 
 func (c *capture) InitConn(startTime time.Time, connID uint64, db string) {
@@ -277,7 +279,8 @@ func (c *capture) Capture(packet []byte, startTime time.Time, connID uint64, ini
 		// initSession is slow, do not call it in the lock.
 		sql, err := initSession()
 		if err != nil {
-			c.lg.Warn("failed to init session", zap.Error(err))
+			// Maybe the connection is in transaction or closing.
+			c.lg.Debug("failed to init session", zap.Uint64("connID", connID), zap.Error(err))
 			return
 		}
 		initPacket := make([]byte, 0, len(sql)+1)
@@ -318,7 +321,7 @@ func (c *capture) putCommand(command *cmd.Command) bool {
 		command.Payload = []byte{pnet.ComResetConnection.Byte()}
 	case pnet.ComQuery:
 		// Avoid password leakage.
-		if IsSensitiveSQL(hack.String(command.Payload[1:])) {
+		if lex.IsSensitiveSQL(hack.String(command.Payload[1:])) {
 			c.filteredCmds++
 			return false
 		}
@@ -333,24 +336,24 @@ func (c *capture) putCommand(command *cmd.Command) bool {
 	}
 }
 
-func (c *capture) writeMeta(duration time.Duration, cmds uint64) {
-	meta := store.Meta{Duration: duration, Cmds: cmds}
+func (c *capture) writeMeta(duration time.Duration, cmds, filteredCmds uint64) {
+	meta := store.NewMeta(duration, cmds, filteredCmds)
 	if err := meta.Write(c.cfg.Output); err != nil {
 		c.lg.Error("failed to write meta", zap.Error(err))
 	}
 }
 
-func (c *capture) Progress() (float64, time.Time, error) {
+func (c *capture) Progress() (float64, time.Time, bool, error) {
 	c.Lock()
 	defer c.Unlock()
 	if c.status == statusIdle || c.cfg.Duration == 0 {
-		return c.progress, c.endTime, c.err
+		return c.progress, c.endTime, true, c.err
 	}
 	progress := float64(time.Since(c.startTime)) / float64(c.cfg.Duration)
 	if progress > 1 {
 		progress = 1
 	}
-	return progress, c.endTime, c.err
+	return progress, c.endTime, false, c.err
 }
 
 // stopNoLock must be called after holding a lock.

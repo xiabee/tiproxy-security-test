@@ -34,17 +34,20 @@ type Exception interface {
 	Type() ExceptionType
 	Key() string
 	ConnID() uint64
+	Time() time.Time
 }
 
 type OtherException struct {
 	err    error
 	connID uint64
+	ts     time.Time
 }
 
 func NewOtherException(err error, connID uint64) *OtherException {
 	return &OtherException{
 		err:    err,
 		connID: connID,
+		ts:     time.Now(),
 	}
 }
 
@@ -68,6 +71,10 @@ func (oe *OtherException) Error() string {
 	return oe.err.Error()
 }
 
+func (oe *OtherException) Time() time.Time {
+	return oe.ts
+}
+
 type FailException struct {
 	key     string
 	err     error
@@ -83,7 +90,8 @@ func NewFailException(err error, command *cmd.Command) *FailException {
 	}
 	var b []byte
 	switch command.Type {
-	case pnet.ComQuery, pnet.ComStmtPrepare, pnet.ComStmtExecute:
+	case pnet.ComQuery, pnet.ComStmtPrepare, pnet.ComStmtExecute, pnet.ComStmtClose, pnet.ComStmtSendLongData,
+		pnet.ComStmtReset, pnet.ComStmtFetch:
 		digest := command.Digest()
 		b = make([]byte, 1+len(digest))
 		b[0] = command.Type.Byte()
